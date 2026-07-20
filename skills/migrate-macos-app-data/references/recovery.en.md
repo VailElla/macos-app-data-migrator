@@ -30,7 +30,7 @@ To cancel, the user renames `Name.internal-backup` to its original name in Finde
 
 1. Quit the app and every helper.
 2. Reveal the original path in Finder; the user moves the symlink to Trash.
-3. The user renames the sibling `Name.internal-backup` to the original name.
+3. By default, select the original data directory in Trash and choose Put Back. If a sibling backup was used, rename `Name.internal-backup` to the original name.
 4. Launch against the internal source and confirm recovery.
 5. Retain the external copy and journal while diagnosing. A sandbox denial commonly means a plain symlink is insufficient.
 

@@ -1371,10 +1371,12 @@ def command_reveal(arguments: argparse.Namespace) -> None:
         print("First launch and smoke-test the external app. Then move the internal app to Trash in Finder.")
         print("请先启动并实测外接盘应用；确认正常后，再在访达中把内置应用移到废纸篓。")
     else:
-        print(f"In Finder, rename the source to: {source.name}.internal-backup")
-        print(f"请在访达中把源目录重命名为：{source.name}.internal-backup")
-        print("Return here only after Finder finishes. The tool will not delete or rename it.")
-        print("访达完成后再返回；本工具不会删除或重命名该目录。")
+        print("After explicit authorization, move the source to Trash in Finder but do not empty Trash.")
+        print("用户明确授权后，请在访达中把源目录移到废纸篓，但不要清空废纸篓。")
+        print(f"Use a sibling backup only when explicitly selected: {source.name}.internal-backup")
+        print(f"只有明确选择同级备份时才改名为：{source.name}.internal-backup")
+        print("Return only after Finder finishes. The helper itself will not move or delete the source.")
+        print("访达完成后再继续；迁移脚本本身不会移动或删除源目录。")
     if not arguments.print_only:
         subprocess.run(["/usr/bin/open", "-R", str(reveal_path)], check=True)
 
@@ -1414,7 +1416,7 @@ def command_link(arguments: argparse.Namespace) -> None:
         )
 
     print(f"Link / 链接: {source} -> {destination}")
-    print("This creates only a small symlink; it does not delete the Finder backup / 仅建立小型软链接，不删除访达备份")
+    print("This creates only a small symlink; it does not empty Trash or delete the Finder recovery copy / 仅建立小型软链接，不清空废纸篓或删除访达恢复副本")
     if not arguments.execute:
         print("Dry run only / 仅预演；审核后添加 --execute")
         return
@@ -1422,7 +1424,7 @@ def command_link(arguments: argparse.Namespace) -> None:
     state["status"] = "linked"
     state["linked_at"] = time.time()
     write_state(state_path_for(destination), state)
-    print("Link created. Keep the Finder backup until the app passes a real smoke test / 链接已建立；应用实测通过前请保留访达备份")
+    print("Link created. Keep the Finder recovery copy until the app passes a real smoke test / 链接已建立；应用实测通过前请保留访达恢复副本")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1457,7 +1459,7 @@ def build_parser() -> argparse.ArgumentParser:
     reveal.add_argument("--print-only", action="store_true")
     reveal.set_defaults(handler=command_reveal)
 
-    link = subparsers.add_parser("link", help="create a symlink after manual Finder rename / 访达手动重命名后建立软链接")
+    link = subparsers.add_parser("link", help="create a symlink after Finder handoff / 访达交接后建立软链接")
     link.add_argument("--source", required=True)
     link.add_argument("--destination", required=True)
     link.add_argument("--execute", action="store_true")

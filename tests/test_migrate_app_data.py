@@ -416,7 +416,7 @@ class MigrationTests(unittest.TestCase):
                 (destination / "first-hardlink.bin").stat().st_ino,
             )
 
-    def test_finder_handoff_requires_manual_rename_before_link(self) -> None:
+    def test_finder_handoff_requires_source_path_to_be_free_before_link(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-finder-") as temporary:
             root = Path(temporary)
             source = root / "internal" / "App Data"
@@ -442,8 +442,10 @@ class MigrationTests(unittest.TestCase):
                 "--print-only",
             )
             self.assertIn("Finder handoff", reveal.stdout)
+            self.assertIn("move the source to Trash", reveal.stdout)
+            self.assertIn("do not empty Trash", reveal.stdout)
 
-            # The test rename stands in for the explicit Finder action performed by a user.
+            # This test covers the explicitly selected sibling-backup fallback.
             backup = source.with_name(f"{source.name}.internal-backup")
             os.rename(source, backup)
             dry_run = run_migrator(
@@ -471,6 +473,32 @@ class MigrationTests(unittest.TestCase):
                 "--print-only",
             )
             self.assertIn(str(backup), backup_reveal.stdout)
+
+    def test_finder_trash_handoff_allows_link_with_recoverable_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-finder-trash-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "App Data"
+            destination = self.external_parent("finder-trash") / "App Data"
+            write_file(source / "content.bin", b"recoverable source")
+
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            run_migrator("verify", "--source", str(source), "--destination", str(destination))
+
+            simulated_trash = root / "Trash"
+            simulated_trash.mkdir()
+            trashed_source = simulated_trash / source.name
+            os.rename(source, trashed_source)
+
+            dry_run = run_migrator("link", "--source", str(source), "--destination", str(destination))
+            self.assertIn("does not empty Trash", dry_run.stdout)
+            self.assertFalse(os.path.lexists(source))
+
+            run_migrator(
+                "link", "--source", str(source), "--destination", str(destination), "--execute"
+            )
+            self.assertTrue(source.is_symlink())
+            self.assertEqual(source.resolve(), destination.resolve())
+            self.assertEqual((trashed_source / "content.bin").read_bytes(), b"recoverable source")
 
     def test_dry_run_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-dry-") as temporary:

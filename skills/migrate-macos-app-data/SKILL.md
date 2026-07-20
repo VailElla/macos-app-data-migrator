@@ -76,7 +76,7 @@ python3 scripts/migrate_app_data.py reveal \
 
 ### 4B. 数据目录的访达交接
 
-完整校验后运行 `reveal`。默认让用户在访达中把原目录重命名为 `原名.internal-backup`；如果用户明确要求 Codex 代办，Codex 应使用访达界面完成这个可回滚的同卷改名，并在操作前后核对准确源路径与备份路径，不能把改名再次交还给用户，也不能改用终端 `mv`。重命名不会复制数据，也不会额外占用等量内置空间。确认访达操作完成后，预演并建立一个很小的软链接：
+完整校验后运行 `reveal`。默认在用户明确授权后，由 Codex 通过访达界面把准确的内置源目录移到系统废纸篓，但绝不清空废纸篓；操作前后都要核对源路径，确保外接副本仍可用。这样会立即腾出原路径，同时保留“放回原处”的回滚能力。若用户明确偏好同级备份，再改用 `原名.internal-backup` 的可回滚同卷改名。两种交接都不能改用终端 `mv` 或删除命令。确认原路径已腾出后，预演并建立一个很小的软链接：
 
 ```bash
 python3 scripts/migrate_app_data.py link \
@@ -93,9 +93,9 @@ python3 scripts/migrate_app_data.py link \
 
 ### 5. 真实验证后才释放空间
 
-保持 `.internal-backup`，完成真实读取、写入、退出、重启和更新检查，并确认新写入落在外接盘。若失败，按[恢复说明（中文）](references/recovery.zh-CN.md)在访达中移除链接并把备份改回原名。
+保持废纸篓中的内置源（或用户选择的 `.internal-backup`），完成真实读取、写入、退出、重启和更新检查，并确认新写入落在外接盘。若失败，按[恢复说明（中文）](references/recovery.zh-CN.md)在访达中移除链接并对废纸篓源执行“放回原处”，或把同级备份改回原名。
 
-只有用户确认全部测试通过，才再次用 `reveal --path "/exact/source.internal-backup"` 定位备份，并请用户在访达中移到废纸篓。提醒用户：只有在访达中清倒废纸篓后空间才真正释放；是否执行仍由用户决定。不得用终端代替这一步。迁移不是备份，清倒后外接盘会成为唯一工作副本。
+只有用户确认全部测试通过，才说明可以永久删除废纸篓中的内置源；清空废纸篓必须在动作发生时再次取得用户确认，且不得自动清空其他内容。若使用同级备份，则先通过 `reveal --path "/exact/source.internal-backup"` 定位并移到废纸篓。不得用终端代替这些步骤。迁移不是备份，永久删除后外接盘会成为唯一工作副本。
 
 鸣潮使用专用流程：[鸣潮适配器（中文）](references/wuthering-waves.zh-CN.md)。任何删除前都遵循[访达交接（中文）](references/finder-handoff.zh-CN.md)。
 
@@ -139,15 +139,15 @@ Keep the real `.app` filename unless updater compatibility with renaming has bee
 
 ### 4B. Finder handoff for a data directory
 
-After full verification, run `reveal` and normally ask the user to rename the original directory to `Name.internal-backup` in Finder. If the user explicitly asks Codex to do it, Codex must perform this reversible same-volume rename through the Finder UI, verify the exact source and backup paths before and after, and must not hand the rename back to the user or substitute Terminal `mv`. Renaming on the same internal filesystem does not duplicate its data. After Finder finishes, dry-run and execute `link`. If the app uses a native location setting or a security-scoped adapter, configure that instead of creating a symlink.
+After full verification, run `reveal`. By default, after explicit user authorization, use the Finder UI to move the exact internal source directory to system Trash without emptying Trash; verify the exact source path before and after and keep the external copy available. This frees the original path while preserving Finder's Put Back rollback. Use a reversible same-volume rename to `Name.internal-backup` only when the user explicitly prefers a sibling backup. Never substitute Terminal `mv` or a deletion command for either handoff. After the original path is free, dry-run and execute `link`. If the app uses a native location setting or a security-scoped adapter, configure that instead of creating a symlink.
 
 A symlink consumes only a small amount of filesystem metadata; it is the only intentional internal write when original-path compatibility is required.
 
 ### 5. Release internal space only after behavior verification
 
-Keep `.internal-backup` through real read/write/quit/relaunch/update testing and verify that new writes land externally. If anything fails, follow [Recovery (English)](references/recovery.en.md) to remove the link and restore the backup name in Finder.
+Keep the internal source in Trash (or the user-selected `.internal-backup`) through real read/write/quit/relaunch/update testing and verify that new writes land externally. If anything fails, follow [Recovery (English)](references/recovery.en.md) to remove the link and use Put Back, or restore the sibling backup name in Finder.
 
-Only after the user confirms every test should `reveal --path "/exact/source.internal-backup"` select the backup for the user to move to Trash in Finder. Explain that space is not released until the user empties Trash in Finder; that decision remains with the user. Never replace the handoff with a Terminal deletion command. Migration is not backup, and the external disk becomes the sole working copy afterward.
+Only after the user confirms every test should you explain that the internal source in Trash may be permanently deleted. Emptying Trash requires a fresh confirmation at action time and must never silently remove unrelated Trash contents. For a sibling backup, use `reveal --path "/exact/source.internal-backup"` before moving it to Trash. Never replace the handoff with a Terminal deletion command. Migration is not backup, and the external disk becomes the sole working copy after permanent deletion.
 
 Use the dedicated [Wuthering Waves adapter (English)](references/wuthering-waves.en.md) for 鸣潮 and follow [Finder handoff (English)](references/finder-handoff.en.md) before any removal.
 
