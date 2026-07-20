@@ -1111,9 +1111,20 @@ def command_copy(arguments: argparse.Namespace) -> None:
     print("Next: run verify before Finder handoff / 下一步：先运行 verify，再进入访达交接")
 
 
+VERIFICATION_IGNORED_XATTRS = {
+    # macOS can attach or rewrite these system-managed attributes when an app
+    # is copied to another volume and first launched. They are not source
+    # payload metadata and cannot remain byte-identical across app instances.
+    b"com.apple.macl",
+    b"com.apple.provenance",
+}
+
+
 def xattr_map(path: Path, follow_symlinks: bool) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for name in list_xattr_names(path, follow_symlinks):
+        if name in VERIFICATION_IGNORED_XATTRS:
+            continue
         value = read_xattr(path, name, follow_symlinks)
         result[name.hex()] = hashlib.sha256(value).hexdigest()
     return result

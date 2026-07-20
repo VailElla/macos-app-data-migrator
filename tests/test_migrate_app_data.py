@@ -628,6 +628,32 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(refused.returncode, 2)
             self.assertIn("Metadata differs", refused.stderr)
 
+    def test_verification_ignores_system_managed_app_xattrs(self) -> None:
+        path = Path("/tmp/example.app")
+        macl = b"com.apple.macl"
+        provenance = b"com.apple.provenance"
+        application_metadata = b"com.example.application-metadata"
+        with mock.patch.object(
+            MIGRATOR_MODULE,
+            "list_xattr_names",
+            return_value=[macl, provenance, application_metadata],
+        ), mock.patch.object(
+            MIGRATOR_MODULE,
+            "read_xattr",
+            return_value=b"preserved-value",
+        ) as read_xattr:
+            result = MIGRATOR_MODULE.xattr_map(path, follow_symlinks=False)
+
+        self.assertEqual(
+            result,
+            {
+                application_metadata.hex(): hashlib.sha256(
+                    b"preserved-value"
+                ).hexdigest()
+            },
+        )
+        read_xattr.assert_called_once_with(path, application_metadata, False)
+
     def test_acls_are_copied_and_tampering_blocks_verification(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-acl-") as temporary:
             root = Path(temporary)
