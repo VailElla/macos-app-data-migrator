@@ -28,6 +28,8 @@ A bilingual Codex Skill for migrating one precisely scoped macOS application or 
 
 macOS 自己仍可能写少量日志、TCC 权限记录、安全书签或偏好设置，因此“操作系统绝对 0 字节写入”无法诚实保证；本项目保证的是不主动在内置盘创建迁移负载、完整副本或构建缓存。
 
+程序自身也可能在真实启动时重新生成着色器、索引等派生缓存。它们不是迁移副本，但会真实占用内置空间；发布前和每次迁移验收都应单独测量并披露，不能把“迁移负载外置”等同于“程序运行时零增长”。
+
 迁移不是备份：清倒内置盘废纸篓后，外接副本会成为唯一工作副本。本项目能防止迁移流程丢失数据，不能防止之后的外接盘物理损坏；重要数据仍应有独立备份。
 
 ### 为什么不会自动删除源文件
@@ -111,6 +113,8 @@ read-only audit → external-only copy → full source/destination verification 
 No user payload or tool temporary data is intentionally written internally. The external volume needs the final dataset capacity plus roughly 64 MiB of tool headroom. Original-path compatibility may require one tiny symlink on the internal filesystem.
 
 macOS may still write small logs, TCC records, security bookmarks, or preferences. Literal zero-byte OS writes cannot honestly be guaranteed; the enforceable guarantee is that this project creates no migration payload, full duplicate, or build cache internally.
+
+The app itself may also regenerate derived shaders, indexes, or other caches during a real launch. These are not migration copies, but they consume real internal space and must be measured and disclosed separately; external-only migration payload does not mean zero runtime growth.
 
 Migration is not backup. After the internal Trash is emptied, the external copy becomes the sole working copy. This project protects the transition from data loss, not a later physical failure of the external disk; important data still needs an independent backup.
 

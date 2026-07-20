@@ -49,6 +49,7 @@ This checklist is the GitHub publication gate. The repository owner should revie
 - [ ] 构建器拒绝覆盖已有 `.app`，不包含 `--replace`。 / The builder refuses an existing `.app` and has no `--replace`.
 - [ ] 只请求所选可移动宗卷与辅助功能，不把完全磁盘访问作为方案。 / It uses selected removable-volume authorization and Accessibility, not Full Disk Access as a workaround.
 - [ ] 生成的本机 `.app` 被 Git 忽略，不会公开。 / Generated machine-specific `.app` bundles are Git-ignored and never published.
+- [ ] 程序运行时派生缓存与迁移负载分开测量和披露，不承诺“运行时零增长”。 / Runtime-derived app caches are measured and disclosed separately from migration payload; zero runtime growth is not promised.
 
 ## 7. 双语、隐私与开源材料 / Bilingual, privacy, and open-source materials
 
@@ -67,7 +68,8 @@ python3 -m py_compile \
   skills/migrate-macos-app-data/scripts/inspect_app.py
 zsh -n skills/migrate-macos-app-data/scripts/build_wuthering_waves_launcher.sh
 python3 -m unittest discover -s tests -v
-xcrun swiftc -parse-as-library -typecheck \
+macos_sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+xcrun swiftc -sdk "$macos_sdk_path" -parse-as-library -typecheck \
   -framework AppKit \
   -framework ApplicationServices \
   skills/migrate-macos-app-data/assets/wuthering-waves-launcher/main.swift
