@@ -336,15 +336,33 @@ def state_path_for(destination: Path) -> Path:
     return destination.parent / f".{destination.name}{STATE_SUFFIX}"
 
 
+def validated_migration_id(state: Dict[str, Any]) -> str:
+    migration_id = state.get("migration_id")
+    if (
+        not isinstance(migration_id, str)
+        or len(migration_id) != 32
+        or any(character not in "0123456789abcdef" for character in migration_id)
+    ):
+        raise MigrationError("Migration journal ID is invalid / 迁移日志 ID 无效")
+    return migration_id
+
+
 def write_state(path: Path, state: Dict[str, Any]) -> None:
     state["updated_at"] = time.time()
-    migration_id = str(state["migration_id"])
-    temporary = path.parent / f".{path.name}.{migration_id}.tmp"
+    migration_id = validated_migration_id(state)
+    write_nonce = uuid.uuid4().hex
+    temporary = path.parent / f".{path.name}.{migration_id}.{write_nonce}.tmp"
     persistent_state = {
         key: value for key, value in state.items() if not key.startswith("_runtime_")
     }
     encoded = (json.dumps(persistent_state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(temporary), flags, 0o600)
+    except OSError as error:
+        raise MigrationError(
+            f"Cannot safely create migration journal temporary / 无法安全创建迁移日志临时文件: {temporary}: {error}"
+        ) from error
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(encoded)
@@ -370,7 +388,7 @@ def checkpoint_state(path: Path, state: Dict[str, Any], force: bool = False) -> 
 
 def load_state(destination: Path, required: bool = True) -> Optional[Dict[str, Any]]:
     state_path = state_path_for(destination)
-    if not state_path.is_file():
+    if state_path.is_symlink() or not state_path.is_file():
         if required:
             raise MigrationError(f"Migration journal not found / 未找到迁移日志: {state_path}")
         return None
@@ -380,12 +398,20 @@ def load_state(destination: Path, required: bool = True) -> Optional[Dict[str, A
         raise MigrationError(f"Cannot read migration journal / 无法读取迁移日志: {error}") from error
     if state.get("schema_version") != SCHEMA_VERSION:
         raise MigrationError("Unsupported migration journal version / 不支持的迁移日志版本")
+    validated_migration_id(state)
     return state
 
 
 def validate_state(state: Dict[str, Any], source: Path, destination: Path, kind: Optional[str] = None) -> None:
     if state.get("source") != str(source) or state.get("destination") != str(destination):
         raise MigrationError("Migration journal paths do not match / 迁移日志路径不匹配")
+    state_kind = state.get("kind")
+    if state_kind not in {"app", "data"}:
+        raise MigrationError("Migration journal kind is invalid / 迁移日志类型无效")
+    if source.suffix.lower() == ".app" and state_kind != "app":
+        raise MigrationError("An app bundle cannot use data migration rules / 应用包不能使用数据迁移规则")
+    if source.is_dir() and not source.is_symlink() and detect_source_kind(source) != state_kind:
+        raise MigrationError("Migration kind does not match the source / 迁移类型与源路径不匹配")
     if kind is not None and state.get("kind") != kind:
         raise MigrationError("Migration kind does not match journal / 迁移类型与日志不匹配")
 
@@ -405,12 +431,24 @@ def require_source_directory(source: Path) -> None:
         raise MigrationError(f"Source directory not found / 找不到源目录: {source}")
 
 
-def resolve_kind(source: Path, requested: str) -> str:
-    if requested != "auto":
-        return requested
+def detect_source_kind(source: Path) -> str:
     if source.suffix.lower() == ".app" and (source / "Contents" / "Info.plist").is_file():
         return "app"
     return "data"
+
+
+def resolve_kind(source: Path, requested: str) -> str:
+    detected = detect_source_kind(source)
+    if source.suffix.lower() == ".app" and detected != "app":
+        raise MigrationError(
+            f"Path has an .app suffix but is not a valid app bundle / 路径以 .app 结尾但不是有效应用包: {source}"
+        )
+    if requested != "auto" and requested != detected:
+        raise MigrationError(
+            f"Requested kind {requested} conflicts with detected kind {detected} / "
+            f"请求类型 {requested} 与检测类型 {detected} 冲突"
+        )
+    return detected
 
 
 def process_is_running(name: str) -> bool:
@@ -520,6 +558,7 @@ def make_initial_state(
     source: Path,
     destination: Path,
     kind: str,
+    process_names: List[str],
     source_info: Dict[str, Any],
     destination_info: Dict[str, Any],
     stats: Dict[str, Any],
@@ -531,6 +570,7 @@ def make_initial_state(
         "source": str(source),
         "destination": str(destination),
         "kind": kind,
+        "process_names": sorted(set(process_names)),
         "status": "copying",
         "created_at": time.time(),
         "updated_at": time.time(),
@@ -951,9 +991,11 @@ def copy_tree(
                 else:
                     guard.check()
                     os.symlink(target, str(destination_path))
-                    copy_symlink_metadata(source_path, destination_path)
                     state["progress"]["symlinks"] += 1
-                    checkpoint_state(state_path, state)
+                # A previous run can stop after creating the link but before
+                # applying its metadata. Always reapply metadata on resume.
+                copy_symlink_metadata(source_path, destination_path)
+                checkpoint_state(state_path, state)
             elif expected["type"] == "file":
                 copy_regular_file(
                     relative,
@@ -1022,11 +1064,21 @@ def command_copy(arguments: argparse.Namespace) -> None:
             source,
             destination,
             kind,
+            arguments.process_name,
             disk_info(source),
             destination_info,
             stats,
             snapshot,
         )
+
+    saved_process_names = state.get("process_names", [])
+    if not isinstance(saved_process_names, list) or any(
+        not isinstance(name, str) or not name for name in saved_process_names
+    ):
+        raise MigrationError("Migration journal process list is invalid / 迁移日志进程列表无效")
+    process_names = sorted(set(saved_process_names) | set(arguments.process_name))
+    state["process_names"] = process_names
+    require_processes_stopped(process_names)
 
     existing_payload = 0
     if destination.is_dir() and not destination.is_symlink():
@@ -1043,7 +1095,7 @@ def command_copy(arguments: argparse.Namespace) -> None:
         print("Re-run with --execute after reviewing the exact paths / 审核准确路径后添加 --execute")
         return
 
-    guard = DestinationGuard(destination.parent, destination_info, arguments.process_name)
+    guard = DestinationGuard(destination.parent, destination_info, process_names)
     if existing_state is None:
         write_state(state_path_for(destination), state)
     copy_tree(source, destination, state, guard)
@@ -1085,44 +1137,132 @@ def verification_record(path: Path, metadata: os.stat_result) -> Dict[str, Any]:
     return record
 
 
+def stability_signature(metadata: os.stat_result) -> Dict[str, Any]:
+    signature = metadata_signature(metadata)
+    signature["ctime_ns"] = metadata.st_ctime_ns
+    return signature
+
+
+def collect_verification_entries(root: Path) -> Dict[str, Tuple[Path, os.stat_result]]:
+    try:
+        return {relative: (path, metadata) for relative, path, metadata in iter_tree(root)}
+    except OSError as error:
+        raise MigrationError(
+            f"Tree changed while being inspected / 检查时目录树发生变化: {root}: {error}"
+        ) from error
+
+
+def verification_stability_snapshot(
+    entries: Dict[str, Tuple[Path, os.stat_result]],
+) -> Dict[str, Dict[str, Any]]:
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    for relative in sorted(entries):
+        path, discovered_metadata = entries[relative]
+        try:
+            before = path.lstat()
+            before_signature = stability_signature(before)
+            if before_signature != stability_signature(discovered_metadata):
+                raise MigrationError(
+                    f"Tree changed while being inspected / 检查时目录树发生变化: {relative}"
+                )
+            record = verification_record(path, before)
+            after_signature = stability_signature(path.lstat())
+        except OSError as error:
+            raise MigrationError(
+                f"Tree changed while being inspected / 检查时目录树发生变化: {relative}: {error}"
+            ) from error
+        if after_signature != before_signature:
+            raise MigrationError(
+                f"Entry changed while metadata was read / 读取元数据时条目发生变化: {relative}"
+            )
+        record["_stability_stat"] = before_signature
+        snapshot[relative] = record
+    return snapshot
+
+
+def stable_sha256_file(path: Path, expected: Dict[str, Any], relative: str) -> str:
+    try:
+        before = stability_signature(path.lstat())
+        if before != expected:
+            raise MigrationError(
+                f"File changed before hashing / 哈希前文件发生变化: {relative}"
+            )
+        digest = sha256_file(path)
+        after = stability_signature(path.lstat())
+    except OSError as error:
+        raise MigrationError(
+            f"File changed while hashing / 哈希时文件发生变化: {relative}: {error}"
+        ) from error
+    if after != before:
+        raise MigrationError(f"File changed while hashing / 哈希时文件发生变化: {relative}")
+    return digest
+
+
+def hardlink_topology(
+    entries: Dict[str, Tuple[Path, os.stat_result]],
+    require_destination_isolation: bool,
+) -> List[Tuple[str, ...]]:
+    inode_groups: Dict[Tuple[int, int], List[str]] = {}
+    for relative, (_path, metadata) in entries.items():
+        if stat.S_ISREG(metadata.st_mode):
+            inode_groups.setdefault((metadata.st_dev, metadata.st_ino), []).append(relative)
+
+    topology: List[Tuple[str, ...]] = []
+    for relatives in inode_groups.values():
+        ordered = tuple(sorted(relatives))
+        if require_destination_isolation:
+            for relative in ordered:
+                metadata = entries[relative][1]
+                if metadata.st_nlink != len(ordered):
+                    raise MigrationError(
+                        "Destination file has a hardlink outside the migration tree / "
+                        f"目标文件在迁移目录树外还有硬链接: {relative}"
+                    )
+        if len(ordered) > 1:
+            topology.append(ordered)
+    return sorted(topology)
+
+
 def full_verify(source: Path, destination: Path) -> Dict[str, str]:
-    source_entries = {relative: (path, metadata) for relative, path, metadata in iter_tree(source)}
-    destination_entries = {
-        relative: (path, metadata) for relative, path, metadata in iter_tree(destination)
-    }
+    source_entries = collect_verification_entries(source)
+    destination_entries = collect_verification_entries(destination)
     if set(source_entries) != set(destination_entries):
         missing = sorted(set(source_entries) - set(destination_entries))[:10]
         extra = sorted(set(destination_entries) - set(source_entries))[:10]
         raise MigrationError(f"Tree entries differ / 目录条目不一致; missing={missing}, extra={extra}")
 
+    source_before = verification_stability_snapshot(source_entries)
+    destination_before = verification_stability_snapshot(destination_entries)
+    source_topology = hardlink_topology(source_entries, require_destination_isolation=False)
+    destination_topology = hardlink_topology(destination_entries, require_destination_isolation=True)
+    if source_topology != destination_topology:
+        raise MigrationError(
+            f"Hardlink topology differs / 硬链接结构不一致: source={source_topology}, destination={destination_topology}"
+        )
+
     hashes: Dict[str, str] = {}
-    source_hardlinks: Dict[Tuple[int, int], List[str]] = {}
     for relative in sorted(source_entries):
-        source_path, source_metadata = source_entries[relative]
-        destination_path, destination_metadata = destination_entries[relative]
-        source_record = verification_record(source_path, source_metadata)
-        destination_record = verification_record(destination_path, destination_metadata)
+        source_path, _source_metadata = source_entries[relative]
+        destination_path, _destination_metadata = destination_entries[relative]
+        source_record = dict(source_before[relative])
+        destination_record = dict(destination_before[relative])
+        source_expected = source_record.pop("_stability_stat")
+        destination_expected = destination_record.pop("_stability_stat")
         if source_record != destination_record:
             raise MigrationError(f"Metadata differs / 元数据不一致: {relative}")
         if source_record["type"] == "file":
-            source_hash = sha256_file(source_path)
-            destination_hash = sha256_file(destination_path)
+            source_hash = stable_sha256_file(source_path, source_expected, relative)
+            destination_hash = stable_sha256_file(destination_path, destination_expected, relative)
             if source_hash != destination_hash:
                 raise MigrationError(f"SHA-256 mismatch / SHA-256 不一致: {relative}")
             hashes[relative] = source_hash
-            if source_metadata.st_nlink > 1:
-                source_hardlinks.setdefault(
-                    (source_metadata.st_dev, source_metadata.st_ino), []
-                ).append(relative)
 
-    for relatives in source_hardlinks.values():
-        destination_inodes = {
-            destination_entries[relative][1].st_ino for relative in relatives
-        }
-        if len(destination_inodes) != 1:
-            raise MigrationError(
-                "Hardlink topology differs / 硬链接结构不一致: " + ", ".join(relatives)
-            )
+    source_after = verification_stability_snapshot(collect_verification_entries(source))
+    destination_after = verification_stability_snapshot(collect_verification_entries(destination))
+    if source_after != source_before:
+        raise MigrationError("Source changed during verification / 校验期间源目录发生变化")
+    if destination_after != destination_before:
+        raise MigrationError("Destination changed during verification / 校验期间目标目录发生变化")
     return hashes
 
 
@@ -1154,6 +1294,12 @@ def command_verify(arguments: argparse.Namespace) -> None:
     require_journal_destination(destination, state)
     if state.get("status") not in {"copied", "verified", "linked"}:
         raise MigrationError("Copy has not completed / 复制尚未完成")
+    process_names = state.get("process_names", [])
+    if not isinstance(process_names, list) or any(
+        not isinstance(name, str) or not name for name in process_names
+    ):
+        raise MigrationError("Migration journal process list is invalid / 迁移日志进程列表无效")
+    require_processes_stopped(process_names)
 
     hashes = full_verify(source, destination)
     if state.get("kind") == "app":
@@ -1167,6 +1313,8 @@ def command_verify(arguments: argparse.Namespace) -> None:
         "xattrs": True,
         "acls": True,
         "hardlinks": True,
+        "stable_snapshots": True,
+        "destination_hardlink_isolation": True,
         "codesign": state.get("kind") == "app",
     }
     write_state(state_path_for(destination), state)

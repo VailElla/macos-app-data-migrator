@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -13,12 +14,25 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Any, Dict
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = REPO_ROOT / "skills" / "migrate-macos-app-data"
 MIGRATOR = SKILL_ROOT / "scripts" / "migrate_app_data.py"
 LAUNCHER_BUILDER = SKILL_ROOT / "scripts" / "build_wuthering_waves_launcher.sh"
+
+
+def load_migrator_module() -> Any:
+    spec = importlib.util.spec_from_file_location("migrate_app_data_for_tests", MIGRATOR)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"Unable to import migrator: {MIGRATOR}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MIGRATOR_MODULE = load_migrator_module()
 
 
 class ExternalAPFSTestVolume:
@@ -215,6 +229,133 @@ class MigrationTests(unittest.TestCase):
         path.mkdir()
         return path
 
+    def test_state_writes_never_follow_temporary_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-state-victim-") as temporary:
+            victim = Path(temporary) / "must-remain-unchanged.txt"
+            victim.write_text("keep me", encoding="utf-8")
+            state_parent = self.external_parent("state-symlink")
+            state_path = state_parent / ".Data.migrate-macos-app-data.json"
+            migration_id = "a" * 32
+            state = {
+                "schema_version": 3,
+                "migration_id": migration_id,
+            }
+
+            old_predictable_temporary = state_parent / f".{state_path.name}.{migration_id}.tmp"
+            old_predictable_temporary.symlink_to(victim)
+            MIGRATOR_MODULE.write_state(state_path, state)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep me")
+            self.assertTrue(old_predictable_temporary.is_symlink())
+            self.assertTrue(state_path.is_file())
+
+            write_nonce = "b" * 32
+            exact_temporary = state_parent / f".{state_path.name}.{migration_id}.{write_nonce}.tmp"
+            exact_temporary.symlink_to(victim)
+            fake_uuid = mock.Mock(hex=write_nonce)
+            with mock.patch.object(MIGRATOR_MODULE.uuid, "uuid4", return_value=fake_uuid):
+                with self.assertRaises(MIGRATOR_MODULE.MigrationError):
+                    MIGRATOR_MODULE.write_state(state_path, state)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep me")
+
+    def test_full_verify_rejects_extra_destination_hardlinks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-hardlink-topology-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            for name in ("a.bin", "b.bin"):
+                write_file(source / name, b"identical payload")
+            fixed_ns = 1_700_000_000_000_000_000
+            for path in (source / "a.bin", source / "b.bin"):
+                os.utime(path, ns=(fixed_ns, fixed_ns))
+            shutil.copy2(source / "a.bin", destination / "a.bin")
+            os.link(destination / "a.bin", destination / "b.bin")
+            MIGRATOR_MODULE.copy_directory_metadata(source, destination)
+
+            with self.assertRaisesRegex(
+                MIGRATOR_MODULE.MigrationError,
+                "Hardlink topology differs",
+            ):
+                MIGRATOR_MODULE.full_verify(source, destination)
+
+    def test_full_verify_rejects_changes_after_a_file_was_checked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-verify-race-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            for name, payload in (("a.bin", b"A-original"), ("b.bin", b"B-original")):
+                write_file(source / name, payload)
+                shutil.copy2(source / name, destination / name)
+            MIGRATOR_MODULE.copy_directory_metadata(source, destination)
+
+            original_sha256 = MIGRATOR_MODULE.sha256_file
+            mutated = False
+
+            def mutate_after_first_file(path: Path) -> str:
+                nonlocal mutated
+                candidate = Path(path)
+                if not mutated and candidate == source / "b.bin":
+                    (destination / "a.bin").write_bytes(b"A-tampered-after-check")
+                    mutated = True
+                return original_sha256(candidate)
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "sha256_file",
+                side_effect=mutate_after_first_file,
+            ):
+                with self.assertRaisesRegex(
+                    MIGRATOR_MODULE.MigrationError,
+                    "Destination changed during verification",
+                ):
+                    MIGRATOR_MODULE.full_verify(source, destination)
+            self.assertNotEqual(
+                (source / "a.bin").read_bytes(),
+                (destination / "a.bin").read_bytes(),
+            )
+
+    def test_app_bundle_cannot_be_downgraded_to_data_kind(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-kind-app-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Example.app"
+            info_path = source / "Contents" / "Info.plist"
+            info_path.parent.mkdir(parents=True)
+            with info_path.open("wb") as handle:
+                plistlib.dump(
+                    {
+                        "CFBundleIdentifier": "test.example.app",
+                        "CFBundleExecutable": "Example",
+                    },
+                    handle,
+                )
+            result = run_migrator(
+                "audit",
+                "--source",
+                str(source),
+                "--destination",
+                "/Volumes/External/Applications/Example.app",
+                "--kind",
+                "data",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("conflicts with detected kind app", result.stderr)
+
+            info_path.unlink()
+            invalid_bundle = run_migrator(
+                "audit",
+                "--source",
+                str(source),
+                "--destination",
+                "/Volumes/External/Applications/Example.app",
+                check=False,
+            )
+            self.assertEqual(invalid_bundle.returncode, 2)
+            self.assertIn("not a valid app bundle", invalid_bundle.stderr)
+
     def test_copy_verify_resume_and_links_preserve_source_exactly(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-copy-") as temporary:
             root = Path(temporary)
@@ -232,7 +373,12 @@ class MigrationTests(unittest.TestCase):
             os.symlink("nested", source / "directory-link")
 
             before = source_snapshot(source)
-            run_migrator(*copy_arguments(source, destination), "--execute")
+            run_migrator(
+                *copy_arguments(source, destination),
+                "--process-name",
+                "NoSuchMigratorProcess",
+                "--execute",
+            )
             self.assertEqual(source_snapshot(source), before)
             self.assertFalse(source.is_symlink())
             self.assertTrue((source / "resume-me.bin").is_file())
@@ -241,6 +387,7 @@ class MigrationTests(unittest.TestCase):
             state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(state["schema_version"], 3)
             self.assertEqual(state["status"], "copied")
+            self.assertEqual(state["process_names"], ["NoSuchMigratorProcess"])
             self.assertFalse(state["source_deleted_by_tool"])
 
             # Simulate an interruption after a normal file and one hardlink
@@ -437,6 +584,13 @@ class MigrationTests(unittest.TestCase):
             )
 
             run_migrator(*copy_arguments(source, destination), "--execute")
+
+            # Simulate an interruption after the destination symlink was created
+            # but before its extended attributes and ACL were applied.
+            (destination / "payload-link").unlink()
+            os.symlink("payload.bin", destination / "payload-link")
+            run_migrator(*copy_arguments(source, destination), "--execute")
+
             verified = run_migrator(
                 "verify", "--source", str(source), "--destination", str(destination)
             )
