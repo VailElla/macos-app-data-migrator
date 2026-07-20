@@ -14,6 +14,7 @@ description: Safely copy, verify, and hand off a macOS application bundle or one
 - 不请求或接收管理员密码，不使用 `sudo`，不以终端命令删除、覆盖或重命名内置盘程序/数据。
 - 只有“完整校验通过 + 真实启用/读写/重启测试通过”才能声明迁移成功。无法证明兼容时保留源文件并停止。
 - 跨宗卷迁移不会增加内置盘中的用户数据占用，但 macOS 可能自行写入少量日志、权限记录或安全书签元数据；不要承诺操作系统层面的绝对零写入。
+- 分开记录迁移负载与程序运行时派生缓存。即使复制器和构建器不向内置盘写迁移负载，程序仍可能重新生成着色器、索引或其他缓存；实测增长超出用户可用空间时必须停止，不能宣称“运行时零增长”。
 
 ### 1. 只读发现准确边界
 
@@ -102,6 +103,7 @@ python3 scripts/migrate_app_data.py link \
 - Never request an administrator password, use `sudo`, or delete, overwrite, or rename internal app/data paths from Terminal.
 - Declare success only after full verification and a real launch/read/write/relaunch smoke test. If compatibility cannot be proved, retain the source and stop.
 - Cross-volume migration adds no user payload to the internal disk. macOS may still create small OS-managed logs, permission records, or security-bookmark metadata, so do not promise literally zero operating-system writes.
+- Measure migration payload separately from runtime-derived app caches. Even when the copier and builder keep all migration payload external, the app may regenerate shaders, indexes, or other caches internally; stop if observed growth exceeds the user's available space, and never claim zero runtime growth.
 
 ### 1. Discover one exact boundary read-only
 

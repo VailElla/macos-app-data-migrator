@@ -7,6 +7,7 @@
 - 默认沙盒容器：`~/Library/Containers/com.kurogame.mingchao`
 - 大型资源通常位于：`Data/Library/Client/Saved/Resources`
 - 只迁移准确的 `Resources`。`Saved` 其余小型配置、状态和日志目录保留在内置盘。
+- 游戏运行时还可能在 `Data/Library/Caches/Metallibs` 生成派生着色器缓存。3.5.0 的一次真机首启/重启验收生成了约 1.1 GB；实际大小会随版本、硬件和既有缓存变化。它不是重复的 `Resources`，但确实占用内置空间。
 - 游戏 `.app` 可能在 `/Applications` 或已挂载宗卷；用 bundle ID 定位并验证签名。
 
 鸣潮受 App Sandbox 约束。即使原路径软链接在访达中可正确解析，游戏仍可能收到外接目标的 `Sandbox: deny`。因此普通软链接不是完整适配器。
@@ -39,12 +40,15 @@ skills/migrate-macos-app-data/scripts/build_wuthering_waves_launcher.sh \
 
 不要把“完全磁盘访问权限”授予游戏或终端作为绕过方案。启动器只需要用户选择的可移动宗卷授权和辅助功能。安全书签、TCC 权限和少量偏好由 macOS 写入内置系统数据，这是不可避免的小型系统元数据，不是迁移负载。
 
+启动前后分别测量沙盒容器和 `Data/Library/Caches`。启动器不会把迁移负载写回内置盘，但不能阻止游戏生成 Metal 着色器等运行时缓存；若剩余空间无法容纳实测增长，停止验收并保留源数据。不要把终端删除这些缓存写成迁移步骤，因为游戏可能在下次启动时再次生成。
+
 ## 实际运行验收
 
 - 游戏进程启动并保持运行。
 - 在提示关闭前后，游戏都持有外接 `Resources` 下的文件句柄。
 - 登录、资源加载、场景进入、一次安全设置写入、完全退出和再次启动都成功。
 - 新增或更新的大型资源写入外接盘；内置 `Saved` 下没有重新生成大型 `Resources`。
+- 单独记录内置 `Data/Library/Caches` 的运行时增长，不把它误报成迁移副本，也不把它隐藏在“零内置增长”结论中。
 - 最近日志中没有针对外接资源路径的新 `sandbox deny`。
 
 这些只读命令可辅助诊断，不需要管理员密码，也不得接上删除命令：
@@ -52,6 +56,7 @@ skills/migrate-macos-app-data/scripts/build_wuthering_waves_launcher.sh \
 ```bash
 game_pid="$(pgrep -x Client-Mac-Shipping)"
 lsof -p "$game_pid" | grep -F "/Volumes/External/WutheringWaves/Resources"
+du -sh "$HOME/Library/Containers/com.kurogame.mingchao/Data/Library/Caches"
 log show --last 3m --style compact \
   --predicate 'eventMessage CONTAINS[c] "WutheringWaves"' | grep -Ei 'deny|sandbox'
 ```

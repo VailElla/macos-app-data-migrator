@@ -79,7 +79,8 @@ python3 -m py_compile \
 zsh -n skills/migrate-macos-app-data/scripts/build_wuthering_waves_launcher.sh
 python3 -m unittest discover -s tests -v
 
-xcrun swiftc -parse-as-library -typecheck \
+macos_sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+xcrun swiftc -sdk "$macos_sdk_path" -parse-as-library -typecheck \
   -framework AppKit \
   -framework ApplicationServices \
   skills/migrate-macos-app-data/assets/wuthering-waves-launcher/main.swift

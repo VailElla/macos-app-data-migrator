@@ -22,7 +22,8 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: Type-check launcher source
         run: |
-          xcrun swiftc -parse-as-library -typecheck \
+          macos_sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+          xcrun swiftc -sdk "$macos_sdk_path" -parse-as-library -typecheck \
             -framework AppKit \
             -framework ApplicationServices \
             skills/migrate-macos-app-data/assets/wuthering-waves-launcher/main.swift

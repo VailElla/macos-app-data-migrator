@@ -221,8 +221,14 @@ export XDG_CACHE_HOME="$tool_cache"
 export CLANG_MODULE_CACHE_PATH="$module_cache"
 export SWIFT_MODULECACHE_PATH="$module_cache"
 
-swiftc_path="$(/usr/bin/xcrun --find swiftc)"
+swiftc_path="$(/usr/bin/xcrun --find swiftc 2>/dev/null || true)"
+macos_sdk_path="$(/usr/bin/xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+if [[ ! -x "$swiftc_path" || ! -d "$macos_sdk_path" ]]; then
+  print -u2 -- "找不到完整的 Swift/macOS SDK 工具链 / Complete Swift/macOS SDK toolchain not found"
+  exit 2
+fi
 "$swiftc_path" \
+  -sdk "$macos_sdk_path" \
   -parse-as-library \
   -O \
   -module-cache-path "$module_cache" \

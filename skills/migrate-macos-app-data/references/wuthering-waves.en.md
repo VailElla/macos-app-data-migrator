@@ -7,6 +7,7 @@ Use this adapter only for the macOS app whose bundle ID is `com.kurogame.mingcha
 - Default sandbox container: `~/Library/Containers/com.kurogame.mingchao`
 - Large payload commonly found at: `Data/Library/Client/Saved/Resources`
 - Migrate only the exact `Resources` directory. Keep the other small configuration, state, and log directories under `Saved` internal.
+- At runtime the game may also generate derived shader caches under `Data/Library/Caches/Metallibs`. One 3.5.0 live launch/relaunch acceptance generated about 1.1 GB; the actual size varies by version, hardware, and prior cache state. This is not a duplicate `Resources`, but it does consume internal space.
 - The game `.app` may be in `/Applications` or on a mounted volume; locate it by bundle ID and verify its signature.
 
 Wuthering Waves is App Sandbox constrained. Even when Finder follows an original-path symlink correctly, the game may receive `Sandbox: deny` for the external target. A plain symlink is therefore not the complete adapter.
@@ -39,12 +40,15 @@ Legacy launchers from earlier manual migrations may compile paths into the binar
 
 Do not grant Full Disk Access to the game or Terminal as a workaround. The launcher needs authorization for the user-selected removable folder and Accessibility only. macOS writes a small security bookmark, TCC record, and preferences internally; this unavoidable OS metadata is not migration payload.
 
+Measure the sandbox container and `Data/Library/Caches` before and after launch. The launcher keeps migration payload external, but it cannot prevent the game from generating runtime caches such as Metal shaders. Stop with the source retained if available space cannot absorb the observed growth. Do not turn Terminal cache deletion into a migration step, because the game may regenerate the cache on its next launch.
+
 ## Live acceptance
 
 - The game process launches and remains alive.
 - The game holds open files below external `Resources` before and after the warning closes.
 - Sign-in, resource loading, entering a scene, one safe settings write, full quit, and relaunch succeed.
 - New or updated large resources land externally, with no large `Resources` recreated under internal `Saved`.
+- Record internal `Data/Library/Caches` runtime growth separately; do not misreport it as migration duplication or hide it behind a zero-internal-growth claim.
 - Recent logs contain no new sandbox denial for the external resource path.
 
 These read-only diagnostic commands need no administrator password and must never be chained to deletion commands:
@@ -52,6 +56,7 @@ These read-only diagnostic commands need no administrator password and must neve
 ```bash
 game_pid="$(pgrep -x Client-Mac-Shipping)"
 lsof -p "$game_pid" | grep -F "/Volumes/External/WutheringWaves/Resources"
+du -sh "$HOME/Library/Containers/com.kurogame.mingchao/Data/Library/Caches"
 log show --last 3m --style compact \
   --predicate 'eventMessage CONTAINS[c] "WutheringWaves"' | grep -Ei 'deny|sandbox'
 ```

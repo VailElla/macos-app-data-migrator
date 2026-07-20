@@ -64,6 +64,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("Never request an administrator password", skill)
         self.assertIn("亲自在访达中", skill)
         self.assertIn("the user moves the internal app to Trash in Finder", skill)
+        self.assertIn("运行时派生缓存", skill)
+        self.assertIn("runtime-derived app caches", skill)
         self.assertNotIn('add_parser("move"', migrator)
         self.assertNotIn('add_parser("restore"', migrator)
         self.assertNotIn("$HOME", builder)
@@ -72,6 +74,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertNotIn("--test-allow", builder)
         self.assertNotIn("--test-allow", migrator)
         self.assertIn('build_root="$(/usr/bin/mktemp -d "$output_parent/', builder)
+        self.assertIn("--show-sdk-path", builder)
+        self.assertIn('-sdk "$macos_sdk_path"', builder)
 
     def test_public_repository_materials_exist(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
