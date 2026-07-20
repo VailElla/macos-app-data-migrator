@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
-"""Move one macOS app-data directory with bounded temporary disk usage.
+#!/usr/bin/python3
+"""Copy and verify one macOS app or app-data directory without deleting its source.
 
-The streaming strategy copies and SHA-256 verifies one file at a time, fsyncs it,
-then removes only that verified source file.  A small JSON journal makes the
-operation resumable.  The source directory is replaced by a symlink only after
-the complete destination tree has been verified.
+All migration payload, journal, partial-copy, and tool-temporary writes are placed
+beside the destination.  The source is read-only.  Removing or renaming the
+internal copy is deliberately handed back to the user in Finder.
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ import hashlib
 import json
 import os
 import plistlib
-import re
 import shutil
 import stat
 import subprocess
@@ -22,38 +20,33 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 1
-CONFIRM_PHRASE = "MOVE_WITHOUT_FULL_BACKUP"
-RESTORE_CONFIRM_PHRASE = "RESTORE_TO_ORIGINAL"
-PARTIAL_PREFIX = ".migrate-macos-app-data-"
+SCHEMA_VERSION = 2
+STATE_SUFFIX = ".migrate-macos-app-data.json"
+COPY_OVERHEAD_BYTES = 64 * 1024 * 1024
+PROCESS_CHECK_INTERVAL = 5.0
+CHUNK_SIZE = 8 * 1024 * 1024
 
 
 class MigrationError(RuntimeError):
-    pass
+    """A safe, expected refusal or validation failure."""
 
 
 def eprint(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def human_bytes(value: int) -> str:
-    units = ("B", "KiB", "MiB", "GiB", "TiB")
-    amount = float(value)
-    for unit in units:
-        if amount < 1024 or unit == units[-1]:
-            return f"{amount:.1f} {unit}"
-        amount /= 1024
-    return f"{value} B"
+def lexical_absolute(value: str) -> Path:
+    expanded = os.path.expanduser(value)
+    if not os.path.isabs(expanded):
+        raise MigrationError(f"Path must be absolute / 路径必须为绝对路径: {value}")
+    return Path(os.path.abspath(expanded))
 
 
-def normalized_path(raw: str) -> Path:
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    return Path(os.path.abspath(path))
+def lexists(path: Path) -> bool:
+    return os.path.lexists(str(path))
 
 
 def is_within(path: Path, parent: Path) -> bool:
@@ -64,7 +57,7 @@ def is_within(path: Path, parent: Path) -> bool:
         return False
 
 
-def validate_scoped_path(path: Path, label: str) -> None:
+def validate_scoped_source(path: Path) -> None:
     home = Path.home()
     forbidden = {
         Path("/"),
@@ -77,891 +70,1140 @@ def validate_scoped_path(path: Path, label: str) -> None:
         home / "Library",
         home / "Library" / "Containers",
         home / "Library" / "Application Support",
+        home / "Library" / "Group Containers",
     }
-    if path in forbidden or len(path.parts) < 4:
-        raise MigrationError(f"Refusing broad {label} path: {path}")
+    if path in forbidden:
+        raise MigrationError(f"Refusing broad source path / 拒绝宽泛源路径: {path}")
+
+    for protected_root in (Path("/System"), Path("/Library"), Path("/usr"), Path("/bin"), Path("/sbin")):
+        if is_within(path, protected_root):
+            raise MigrationError(
+                f"Refusing protected or administrator-owned source / 拒绝受保护或需要管理员权限的源路径: {path}"
+            )
+
+    container_roots = (
+        home / "Library" / "Containers",
+        home / "Library" / "Group Containers",
+    )
+    if any(path.parent == container_root for container_root in container_roots):
+        raise MigrationError(
+            f"Refusing an entire app container; choose one relocatable payload / "
+            f"拒绝迁移整个程序容器，请选择单个可迁移的大型目录: {path}"
+        )
+
+    app_components = [index for index, part in enumerate(path.parts) if part.lower().endswith(".app")]
+    if app_components and app_components[-1] != len(path.parts) - 1:
+        raise MigrationError(
+            f"Refusing a component inside a signed app bundle / 拒绝单独迁移签名应用包内部组件: {path}"
+        )
+
+    parts = path.parts
+    is_application_bundle = (
+        len(parts) == 3
+        and parts[0] == "/"
+        and parts[1] == "Applications"
+        and path.suffix.lower() == ".app"
+    )
+    if not is_application_bundle and len(parts) < 4:
+        raise MigrationError(f"Refusing broad source path / 拒绝宽泛源路径: {path}")
 
 
-def validate_pair(source: Path, destination: Path) -> None:
-    validate_scoped_path(source, "source")
-    validate_scoped_path(destination, "destination")
-    source_compare = source if source.is_symlink() else source.resolve(strict=False)
-    destination_compare = destination.resolve(strict=False)
-    if source == destination or source_compare == destination_compare:
-        raise MigrationError("Source and destination are the same path")
-    if is_within(destination_compare, source_compare):
-        raise MigrationError("Destination cannot be inside source")
-    if is_within(source_compare, destination_compare):
-        raise MigrationError("Source cannot be inside destination")
+def validate_source_and_destination(source: Path, destination: Path) -> None:
+    validate_scoped_source(source)
+    if source == destination:
+        raise MigrationError("Source and destination are identical / 源与目标路径相同")
+
+    # Keep the lexical source location when it is already a symlink. This lets
+    # audit/link inspect an existing integration link without treating its
+    # resolved destination as a recursively nested source.
+    source_real = source if source.is_symlink() else source.resolve(strict=False)
+    destination_real = destination.parent.resolve(strict=False) / destination.name
+    if is_within(destination_real, source_real):
+        raise MigrationError("Destination is inside source / 目标位于源目录内部")
+    if is_within(source_real, destination_real):
+        raise MigrationError("Source is inside destination / 源目录位于目标内部")
+    if destination == Path("/") or len(destination.parts) < 4:
+        raise MigrationError(f"Refusing broad destination path / 拒绝宽泛目标路径: {destination}")
 
 
-def nearest_existing_parent(path: Path) -> Path:
+def nearest_existing(path: Path) -> Path:
     candidate = path
-    while not candidate.exists():
-        if candidate.parent == candidate:
-            raise MigrationError(f"No existing parent for {path}")
+    while not lexists(candidate):
+        if candidate == candidate.parent:
+            raise MigrationError(f"No existing ancestor for path / 路径没有已存在的上级目录: {path}")
         candidate = candidate.parent
+    if candidate.is_symlink():
+        candidate = candidate.resolve(strict=True)
     return candidate
 
 
-def disk_info(path: Path) -> dict[str, Any]:
-    existing = nearest_existing_parent(path)
-    df_result = subprocess.run(
-        ["/bin/df", "-P", str(existing)],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if df_result.returncode != 0 or len(df_result.stdout.splitlines()) < 2:
-        raise MigrationError(f"df could not identify the filesystem for {existing}")
-    device = df_result.stdout.splitlines()[-1].split()[0]
-    result = subprocess.run(
-        ["/usr/sbin/diskutil", "info", "-plist", device],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if result.returncode != 0:
-        raise MigrationError(
-            f"diskutil could not inspect {existing}: "
-            f"{result.stderr.decode(errors='replace').strip()}"
-        )
+def disk_info(path: Path) -> Dict[str, Any]:
+    existing = nearest_existing(path)
+    info: Dict[str, Any] = {
+        "query_path": str(existing),
+        "device": None,
+        "filesystem": None,
+        "volume_uuid": None,
+        "mount_point": None,
+        "internal": None,
+        "free_bytes": shutil.disk_usage(str(existing)).free,
+        "st_dev": existing.stat().st_dev,
+    }
+
     try:
-        return plistlib.loads(result.stdout)
-    except Exception as error:  # pragma: no cover - defensive parser guard
-        raise MigrationError(f"Invalid diskutil response for {existing}: {error}") from error
+        df_result = subprocess.run(
+            ["/bin/df", "-P", str(existing)],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        fields = df_result.stdout.strip().splitlines()[-1].split()
+        if fields:
+            info["device"] = fields[0]
+        if len(fields) >= 6:
+            info["mount_point"] = " ".join(fields[5:])
+    except (OSError, subprocess.CalledProcessError, IndexError):
+        pass
+
+    diskutil = Path("/usr/sbin/diskutil")
+    if diskutil.exists():
+        try:
+            disk_query = str(info.get("device") or existing)
+            result = subprocess.run(
+                [str(diskutil), "info", "-plist", disk_query],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            payload = plistlib.loads(result.stdout)
+            info["filesystem"] = payload.get("FilesystemType") or payload.get("Type (Bundle)")
+            info["volume_uuid"] = payload.get("VolumeUUID") or payload.get("APFSVolumeUUID")
+            info["mount_point"] = payload.get("MountPoint") or info["mount_point"]
+            if "Internal" in payload:
+                info["internal"] = bool(payload["Internal"])
+            info["device"] = payload.get("DeviceNode") or info["device"]
+        except (OSError, subprocess.CalledProcessError, plistlib.InvalidFileException):
+            pass
+
+    if info["filesystem"] is None:
+        info["filesystem"] = "unknown"
+    return info
 
 
-def filesystem_name(info: dict[str, Any]) -> str:
-    return str(
-        info.get("FilesystemType")
-        or info.get("FilesystemName")
-        or info.get("FileSystemPersonality")
-        or "unknown"
-    )
+def format_bytes(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    number = float(value)
+    for unit in units:
+        if number < 1024 or unit == units[-1]:
+            return f"{number:.2f} {unit}"
+        number /= 1024
+    return f"{value} B"
 
 
-def tree_stats(root: Path) -> dict[str, int]:
-    if root.is_symlink():
-        return {
-            "files": 0,
-            "directories": 0,
-            "symlinks": 1,
-            "special": 0,
-            "bytes": 0,
-            "unique_bytes": 0,
-            "largest_file": 0,
-        }
-    if not root.is_dir():
-        raise MigrationError(f"Not a directory: {root}")
+def iter_tree(root: Path) -> Iterable[Tuple[str, Path, os.stat_result]]:
+    """Yield root and descendants without following symbolic links."""
+    stack: List[Tuple[str, Path]] = [(".", root)]
+    while stack:
+        relative, path = stack.pop()
+        metadata = path.lstat()
+        yield relative, path, metadata
+        if stat.S_ISDIR(metadata.st_mode):
+            children = sorted(os.scandir(str(path)), key=lambda entry: entry.name, reverse=True)
+            for entry in children:
+                child_relative = entry.name if relative == "." else f"{relative}/{entry.name}"
+                stack.append((child_relative, Path(entry.path)))
 
-    result = {
+
+def tree_stats(root: Path) -> Dict[str, Any]:
+    stats: Dict[str, Any] = {
         "files": 0,
-        "directories": 1,
+        "directories": 0,
         "symlinks": 0,
         "special": 0,
-        "bytes": 0,
+        "logical_bytes": 0,
         "unique_bytes": 0,
         "largest_file": 0,
     }
-    seen_inodes: set[tuple[int, int]] = set()
-    for current, directory_names, file_names in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        for name in list(directory_names):
-            item = current_path / name
-            item_mode = item.lstat().st_mode
-            if stat.S_ISLNK(item_mode):
-                result["symlinks"] += 1
-                directory_names.remove(name)
-            elif stat.S_ISDIR(item_mode):
-                result["directories"] += 1
-            else:
-                result["special"] += 1
-                directory_names.remove(name)
-        for name in file_names:
-            item = current_path / name
-            item_stat = item.lstat()
-            if stat.S_ISLNK(item_stat.st_mode):
-                result["symlinks"] += 1
-            elif stat.S_ISREG(item_stat.st_mode):
-                result["files"] += 1
-                result["bytes"] += item_stat.st_size
-                inode_key = (item_stat.st_dev, item_stat.st_ino)
-                if inode_key not in seen_inodes:
-                    seen_inodes.add(inode_key)
-                    result["unique_bytes"] += item_stat.st_size
-                result["largest_file"] = max(result["largest_file"], item_stat.st_size)
-            else:
-                result["special"] += 1
-    return result
+    seen_inodes = set()
+    for relative, _path, metadata in iter_tree(root):
+        if stat.S_ISDIR(metadata.st_mode):
+            if relative != ".":
+                stats["directories"] += 1
+        elif stat.S_ISREG(metadata.st_mode):
+            stats["files"] += 1
+            stats["logical_bytes"] += metadata.st_size
+            stats["largest_file"] = max(stats["largest_file"], metadata.st_size)
+            inode_key = (metadata.st_dev, metadata.st_ino)
+            if inode_key not in seen_inodes:
+                seen_inodes.add(inode_key)
+                stats["unique_bytes"] += metadata.st_size
+        elif stat.S_ISLNK(metadata.st_mode):
+            stats["symlinks"] += 1
+        else:
+            stats["special"] += 1
+    return stats
 
 
-def print_stats(label: str, stats: dict[str, int]) -> None:
-    print(
-        f"{label}: {stats['files']} files, {stats['directories']} directories, "
-        f"{stats['symlinks']} symlinks, {human_bytes(stats['bytes'])} logical data, "
-        f"{human_bytes(stats.get('unique_bytes', stats['bytes']))} unique file data, "
-        f"largest file {human_bytes(stats['largest_file'])}"
-    )
+def metadata_signature(metadata: os.stat_result) -> Dict[str, Any]:
+    return {
+        "type": file_type(metadata.st_mode),
+        "size": metadata.st_size if stat.S_ISREG(metadata.st_mode) else 0,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mtime_ns": metadata.st_mtime_ns,
+        "flags": getattr(metadata, "st_flags", 0),
+        "inode": metadata.st_ino,
+        "device": metadata.st_dev,
+        "nlink": metadata.st_nlink,
+    }
+
+
+def source_snapshot(root: Path) -> Dict[str, Dict[str, Any]]:
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    for relative, path, metadata in iter_tree(root):
+        record = metadata_signature(metadata)
+        if stat.S_ISLNK(metadata.st_mode):
+            record["link_target"] = os.readlink(str(path))
+        snapshot[relative] = record
+    return snapshot
+
+
+def file_type(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    return "special"
 
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb", buffering=1024 * 1024) as handle:
+    with path.open("rb", buffering=0) as handle:
         while True:
-            block = handle.read(8 * 1024 * 1024)
-            if not block:
+            chunk = handle.read(CHUNK_SIZE)
+            if not chunk:
                 break
-            digest.update(block)
+            digest.update(chunk)
     return digest.hexdigest()
 
 
+def state_path_for(destination: Path) -> Path:
+    return destination.parent / f".{destination.name}{STATE_SUFFIX}"
+
+
+def write_state(path: Path, state: Dict[str, Any]) -> None:
+    state["updated_at"] = time.time()
+    migration_id = str(state["migration_id"])
+    temporary = path.parent / f".{path.name}.{migration_id}.tmp"
+    persistent_state = {
+        key: value for key, value in state.items() if not key.startswith("_runtime_")
+    }
+    encoded = (json.dumps(persistent_state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    os.replace(str(temporary), str(path))
+    fsync_directory(path.parent)
+
+
+def checkpoint_state(path: Path, state: Dict[str, Any], force: bool = False) -> None:
+    now = time.monotonic()
+    previous = float(state.get("_runtime_last_checkpoint", 0.0))
+    if force or now - previous >= PROCESS_CHECK_INTERVAL:
+        write_state(path, state)
+        state["_runtime_last_checkpoint"] = now
+
+
+def load_state(destination: Path, required: bool = True) -> Optional[Dict[str, Any]]:
+    state_path = state_path_for(destination)
+    if not state_path.is_file():
+        if required:
+            raise MigrationError(f"Migration journal not found / 未找到迁移日志: {state_path}")
+        return None
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise MigrationError(f"Cannot read migration journal / 无法读取迁移日志: {error}") from error
+    if state.get("schema_version") != SCHEMA_VERSION:
+        raise MigrationError("Unsupported migration journal version / 不支持的迁移日志版本")
+    return state
+
+
+def validate_state(state: Dict[str, Any], source: Path, destination: Path, kind: Optional[str] = None) -> None:
+    if state.get("source") != str(source) or state.get("destination") != str(destination):
+        raise MigrationError("Migration journal paths do not match / 迁移日志路径不匹配")
+    if kind is not None and state.get("kind") != kind:
+        raise MigrationError("Migration kind does not match journal / 迁移类型与日志不匹配")
+
+
 def fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    descriptor = os.open(str(path), os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
 
-def state_path_for(destination: Path, override: str | None) -> Path:
-    if override:
-        candidate = normalized_path(override)
-        if candidate.parent != destination.parent:
-            raise MigrationError("A custom journal must stay beside the destination directory")
-        return candidate
-    return destination.parent / f".{destination.name}.migrate-macos-app-data.json"
+def require_source_directory(source: Path) -> None:
+    if source.is_symlink():
+        raise MigrationError(f"Source is already a symbolic link / 源路径已是软链接: {source}")
+    if not source.is_dir():
+        raise MigrationError(f"Source directory not found / 找不到源目录: {source}")
 
 
-def write_state(path: Path, state_data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(state_data, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    fsync_directory(path.parent)
+def resolve_kind(source: Path, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    if source.suffix.lower() == ".app" and (source / "Contents" / "Info.plist").is_file():
+        return "app"
+    return "data"
 
 
-def read_state(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    if data.get("schema_version") != SCHEMA_VERSION:
-        raise MigrationError(f"Unsupported state schema in {path}")
-    migration_id = str(data.get("migration_id") or "")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", migration_id):
-        raise MigrationError(f"Invalid migration ID in {path}")
-    return data
+def process_is_running(name: str) -> bool:
+    result = subprocess.run(
+        ["/usr/bin/pgrep", "-x", name],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
 
 
-def check_state_paths(state_data: dict[str, Any], source: Path, destination: Path) -> None:
-    if state_data.get("source") != str(source) or state_data.get("destination") != str(destination):
-        raise MigrationError("Existing migration journal belongs to different paths")
-
-
-def check_processes(process_names: Iterable[str]) -> None:
-    running: list[str] = []
-    for name in process_names:
-        result = subprocess.run(
-            ["/usr/bin/pgrep", "-x", name],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if result.returncode == 0:
-            running.append(name)
+def require_processes_stopped(names: List[str]) -> None:
+    running = [name for name in names if process_is_running(name)]
     if running:
-        raise MigrationError("Quit these processes before migration: " + ", ".join(running))
-
-
-def ensure_apfs(destination: Path, allow_non_apfs: bool) -> dict[str, Any]:
-    info = disk_info(destination)
-    fs_name = filesystem_name(info)
-    if "apfs" not in fs_name.lower() and not allow_non_apfs:
         raise MigrationError(
-            f"Destination filesystem is {fs_name}, not APFS. "
-            "Use an APFS volume or explicitly pass --allow-non-apfs after reviewing metadata risks."
+            "Quit these processes before continuing / 请先完全退出这些进程: " + ", ".join(running)
         )
+
+
+class DestinationGuard:
+    def __init__(self, parent: Path, volume: Dict[str, Any], process_names: List[str]) -> None:
+        self.parent = parent
+        self.expected_device = parent.stat().st_dev
+        self.expected_uuid = volume.get("volume_uuid")
+        self.process_names = process_names
+        self.last_slow_check = 0.0
+
+    def check(self, force_slow: bool = False) -> None:
+        if not self.parent.is_dir() or self.parent.is_symlink():
+            raise MigrationError("Destination volume disappeared / 目标宗卷已断开")
+        if self.parent.stat().st_dev != self.expected_device:
+            raise MigrationError("Destination device changed / 目标设备已变化，立即停止")
+        now = time.monotonic()
+        if force_slow or now - self.last_slow_check >= PROCESS_CHECK_INTERVAL:
+            require_processes_stopped(self.process_names)
+            current = disk_info(self.parent)
+            if self.expected_uuid and current.get("volume_uuid") != self.expected_uuid:
+                raise MigrationError("Destination volume UUID changed / 目标宗卷 UUID 已变化")
+            self.last_slow_check = now
+
+
+def require_destination_policy(
+    destination: Path,
+    allow_internal: bool,
+    allow_non_apfs: bool,
+) -> Dict[str, Any]:
+    parent = destination.parent
+    if not parent.is_dir() or parent.is_symlink():
+        raise MigrationError(
+            "Destination parent must already exist and must not be a symlink / "
+            f"目标上级目录必须已存在且不能是软链接: {parent}"
+        )
+    if not allow_internal and parent.resolve(strict=True) != parent:
+        raise MigrationError(
+            f"Destination parent must use its canonical path / 目标上级目录必须使用真实路径而非别名: {parent}"
+        )
+    info = disk_info(parent)
+    if not allow_internal and info.get("internal") is not False:
+        raise MigrationError(
+            "Destination is not confirmed as an external volume / 未确认目标为外接宗卷; "
+            "the internal-volume override exists only for isolated tests"
+        )
+    filesystem = str(info.get("filesystem") or "").lower()
+    if not allow_non_apfs and filesystem != "apfs":
+        raise MigrationError(
+            f"Destination filesystem is {filesystem or 'unknown'}, not APFS / 目标文件系统不是 APFS"
+        )
+    if not allow_internal and not info.get("volume_uuid"):
+        raise MigrationError("External APFS volume UUID is unavailable / 无法读取外接 APFS 宗卷 UUID")
     return info
 
 
-def source_link_matches(source: Path, destination: Path) -> bool:
-    if not source.is_symlink():
-        return False
-    return source.resolve(strict=False) == destination.resolve(strict=False)
+def print_audit(source: Path, destination: Path, kind: str, stats: Dict[str, Any], info: Dict[str, Any]) -> None:
+    print("Read-only audit / 只读审计")
+    print(f"  Source / 源: {source}")
+    print(f"  Destination / 目标: {destination}")
+    print(f"  Kind / 类型: {kind}")
+    print(f"  Files / 文件: {stats['files']}")
+    print(f"  Directories / 目录: {stats['directories']}")
+    print(f"  Symlinks / 软链接: {stats['symlinks']}")
+    print(f"  Logical size / 逻辑大小: {format_bytes(stats['logical_bytes'])}")
+    print(f"  Unique payload / 去重后数据: {format_bytes(stats['unique_bytes'])}")
+    print(f"  Largest file / 最大文件: {format_bytes(stats['largest_file'])}")
+    print(f"  Destination free / 目标可用: {format_bytes(int(info['free_bytes']))}")
+    print(f"  Filesystem / 文件系统: {info.get('filesystem') or 'unknown'}")
+    print(f"  External / 外接: {info.get('internal') is False}")
+    print(f"  Mount point / 挂载点: {info.get('mount_point') or 'unknown'}")
+    print("  Source mutation / 源路径改动: none / 无")
 
 
-def guard_destination_root(destination_root: Path, expected_device: int) -> None:
-    if not destination_root.is_dir() or destination_root.stat().st_dev != expected_device:
-        raise MigrationError(
-            "Destination volume disappeared or changed. Reconnect the original volume and resume."
-        )
+def command_audit(arguments: argparse.Namespace) -> None:
+    source = lexical_absolute(arguments.source)
+    destination = lexical_absolute(arguments.destination)
+    validate_source_and_destination(source, destination)
+
+    if source.is_symlink():
+        print("Read-only audit / 只读审计")
+        print(f"  Source / 源: {source}")
+        print(f"  Existing symlink target / 现有软链接目标: {os.readlink(str(source))}")
+        return
+    require_source_directory(source)
+    kind = resolve_kind(source, arguments.kind)
+    stats = tree_stats(source)
+    info = disk_info(destination.parent)
+    print_audit(source, destination, kind, stats, info)
+    if stats["special"]:
+        raise MigrationError("Source contains special files / 源目录包含不支持的特殊文件")
 
 
-def ensure_destination_parent(destination_root: Path, destination: Path, expected_device: int) -> None:
-    guard_destination_root(destination_root, expected_device)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    guard_destination_root(destination_root, expected_device)
-    if destination.parent.stat().st_dev != expected_device:
-        raise MigrationError("Destination parent is no longer on the expected volume")
-
-
-def copy_symlink(
+def make_initial_state(
     source: Path,
     destination: Path,
-    destination_root: Path,
-    expected_device: int,
+    kind: str,
+    source_info: Dict[str, Any],
+    destination_info: Dict[str, Any],
+    stats: Dict[str, Any],
+    snapshot: Dict[str, Dict[str, Any]],
+    allow_internal_destination: bool,
+) -> Dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "migration_id": uuid.uuid4().hex,
+        "source": str(source),
+        "destination": str(destination),
+        "kind": kind,
+        "status": "copying",
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "source_volume_uuid": source_info.get("volume_uuid"),
+        "destination_volume_uuid": destination_info.get("volume_uuid"),
+        "destination_device": destination_info.get("device"),
+        "destination_st_dev": destination_info.get("st_dev"),
+        "test_allow_internal_destination": allow_internal_destination,
+        "initial_stats": stats,
+        "source_snapshot": snapshot,
+        "progress": {"files": 0, "symlinks": 0, "bytes": 0},
+        "hardlinks": {},
+        "file_sha256": {},
+        "source_deleted_by_tool": False,
+    }
+
+
+def require_journal_destination(destination: Path, state: Dict[str, Any]) -> Dict[str, Any]:
+    current = disk_info(destination)
+    allow_internal = bool(state.get("test_allow_internal_destination", False))
+    if not allow_internal and current.get("internal") is not False:
+        raise MigrationError(
+            "Verified external destination is no longer mounted / 已校验的外接目标当前未挂载"
+        )
+    if not allow_internal and str(current.get("filesystem") or "").lower() != "apfs":
+        raise MigrationError("Destination is no longer external APFS / 目标已不是外接 APFS")
+    expected_uuid = state.get("destination_volume_uuid")
+    if expected_uuid:
+        if current.get("volume_uuid") != expected_uuid:
+            raise MigrationError("Destination volume UUID differs from journal / 目标宗卷 UUID 与日志不一致")
+    elif current.get("st_dev") != state.get("destination_st_dev"):
+        raise MigrationError("Destination device differs from journal / 目标设备与日志不一致")
+    return current
+
+
+def assert_snapshot_entry(relative: str, path: Path, expected: Dict[str, Any]) -> os.stat_result:
+    if not lexists(path):
+        raise MigrationError(f"Source changed during copy / 复制期间源路径发生变化: {relative}")
+    current = path.lstat()
+    actual = metadata_signature(current)
+    keys = ("type", "size", "mode", "uid", "gid", "mtime_ns", "flags", "inode", "device", "nlink")
+    if any(actual.get(key) != expected.get(key) for key in keys):
+        raise MigrationError(f"Source changed during copy / 复制期间源路径发生变化: {relative}")
+    if actual["type"] == "symlink" and os.readlink(str(path)) != expected.get("link_target"):
+        raise MigrationError(f"Source symlink changed during copy / 复制期间源软链接发生变化: {relative}")
+    return current
+
+
+def copy_xattrs(source: Path, destination: Path, follow_symlinks: bool) -> None:
+    try:
+        source_names = os.listxattr(str(source), follow_symlinks=follow_symlinks)
+    except (AttributeError, OSError):
+        return
+    for name in source_names:
+        try:
+            value = os.getxattr(str(source), name, follow_symlinks=follow_symlinks)
+            os.setxattr(str(destination), name, value, follow_symlinks=follow_symlinks)
+        except OSError as error:
+            raise MigrationError(f"Unable to preserve extended attribute {name}: {error}") from error
+
+
+def acl_entries(path: Path) -> List[str]:
+    try:
+        result = subprocess.run(
+            ["/bin/ls", "-lde", str(path)],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    lines = result.stdout.splitlines()[1:]
+    return [line.strip() for line in lines if line.strip()]
+
+
+def copy_directory_metadata(source: Path, destination: Path) -> None:
+    shutil.copystat(str(source), str(destination), follow_symlinks=False)
+    copy_xattrs(source, destination, follow_symlinks=False)
+    entries = acl_entries(source)
+    if entries:
+        acl_text = "\n".join(entries) + "\n"
+        try:
+            subprocess.run(
+                ["/bin/chmod", "-E", str(destination)],
+                input=acl_text,
+                text=True,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise MigrationError(f"Unable to preserve directory ACL / 无法保留目录 ACL: {source}: {error}") from error
+
+
+def copy_symlink_metadata(source: Path, destination: Path) -> None:
+    copy_xattrs(source, destination, follow_symlinks=False)
+    try:
+        shutil.copystat(str(source), str(destination), follow_symlinks=False)
+    except (NotImplementedError, OSError):
+        pass
+
+
+def partial_path(destination_file: Path, migration_id: str) -> Path:
+    return destination_file.parent / f".{destination_file.name}.{migration_id}.partial"
+
+
+def prepare_owned_partial(path: Path, destination: Path, migration_id: str) -> None:
+    expected_suffix = f".{migration_id}.partial"
+    if not path.name.endswith(expected_suffix) or not is_within(path, destination):
+        raise MigrationError(f"Refusing to rewrite unowned artifact / 拒绝改写非本工具临时文件: {path}")
+    if lexists(path):
+        if path.is_symlink() or not path.is_file():
+            raise MigrationError(f"Owned partial is no longer a regular file / 临时文件已不是普通文件: {path}")
+        descriptor = os.open(str(path), os.O_WRONLY | os.O_TRUNC)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def ensure_parent_directories(
+    relative: str,
+    source: Path,
+    destination: Path,
+    snapshot: Dict[str, Dict[str, Any]],
+    guard: DestinationGuard,
 ) -> None:
-    target = os.readlink(source)
-    ensure_destination_parent(destination_root, destination, expected_device)
-    if destination.is_symlink():
-        if os.readlink(destination) != target:
-            raise MigrationError(f"Conflicting destination symlink: {destination}")
-    elif destination.exists():
-        raise MigrationError(f"Destination already exists with another type: {destination}")
-    else:
-        os.symlink(target, destination)
-        fsync_directory(destination.parent)
-    source.unlink()
+    relative_path = Path(relative)
+    current = Path()
+    for part in relative_path.parts[:-1]:
+        current = current / part
+        current_text = current.as_posix()
+        expected = snapshot.get(current_text)
+        if not expected or expected.get("type") != "directory":
+            raise MigrationError(f"Invalid source snapshot parent / 源快照上级目录无效: {current_text}")
+        source_dir = source / current
+        destination_dir = destination / current
+        assert_snapshot_entry(current_text, source_dir, expected)
+        guard.check()
+        if lexists(destination_dir):
+            if destination_dir.is_symlink() or not destination_dir.is_dir():
+                raise MigrationError(f"Destination entry type mismatch / 目标条目类型不匹配: {destination_dir}")
+        else:
+            destination_dir.mkdir(mode=0o700)
 
 
-class StateRecorder:
-    def __init__(self, path: Path, state_data: dict[str, Any]) -> None:
-        self.path = path
-        self.state_data = state_data
-        self.pending_files = 0
-        self.pending_bytes = 0
-
-    def completed(self, byte_count: int) -> None:
-        progress = self.state_data["progress"]
-        progress["files"] += 1
-        progress["bytes"] += byte_count
-        self.pending_files += 1
-        self.pending_bytes += byte_count
-        if self.pending_files >= 64 or self.pending_bytes >= 256 * 1024 * 1024:
-            self.flush()
-
-    def completed_symlink(self) -> None:
-        self.state_data["progress"]["symlinks"] += 1
-        self.pending_files += 1
-        if self.pending_files >= 64:
-            self.flush()
-
-    def flush(self) -> None:
-        self.state_data["updated_at"] = int(time.time())
-        write_state(self.path, self.state_data)
-        self.pending_files = 0
-        self.pending_bytes = 0
+def destination_file_matches(source_file: Path, destination_file: Path, expected_hash: Optional[str]) -> Tuple[bool, str]:
+    if not destination_file.is_file() or destination_file.is_symlink():
+        return False, ""
+    if source_file.stat().st_size != destination_file.stat().st_size:
+        return False, ""
+    source_hash = expected_hash or sha256_file(source_file)
+    return sha256_file(destination_file) == source_hash, source_hash
 
 
-def remove_own_partials(destination: Path, migration_id: str) -> int:
-    if not destination.exists():
-        return 0
-    prefix = f"{PARTIAL_PREFIX}{migration_id}-"
-    removed = 0
-    for current, _, files in os.walk(destination):
-        for name in files:
-            if name.startswith(prefix) and name.endswith(".partial"):
-                partial = Path(current) / name
-                partial.unlink()
-                removed += 1
-    return removed
-
-
-def source_unchanged(before: os.stat_result, after: os.stat_result) -> bool:
-    return (
-        before.st_dev == after.st_dev
-        and before.st_ino == after.st_ino
-        and before.st_size == after.st_size
-        and before.st_mtime_ns == after.st_mtime_ns
+def ditto_copy_file(source: Path, partial: Path, work_root: Path) -> None:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TMPDIR": str(work_root),
+            "TMP": str(work_root),
+            "TEMP": str(work_root),
+            "XDG_CACHE_HOME": str(work_root),
+        }
     )
-
-
-def verified_existing_file(source: Path, destination: Path) -> bool:
-    if not destination.is_file() or destination.is_symlink():
-        return False
-    source_stat = source.stat()
-    destination_stat = destination.stat()
-    if source_stat.st_size != destination_stat.st_size:
-        return False
-    return sha256_file(source) == sha256_file(destination)
+    result = subprocess.run(
+        ["/usr/bin/ditto", "--rsrc", "--extattr", "--acl", str(source), str(partial)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=environment,
+    )
+    if result.returncode != 0:
+        raise MigrationError(f"ditto failed for {source}: {result.stderr.strip()}")
 
 
 def copy_regular_file(
-    source: Path,
+    relative: str,
+    source_file: Path,
+    destination_file: Path,
+    source_metadata: os.stat_result,
     destination: Path,
-    relative_path: Path,
-    migration_id: str,
-    state_data: dict[str, Any],
-    recorder: StateRecorder,
-    destination_root: Path,
-    expected_device: int,
+    work_root: Path,
+    state: Dict[str, Any],
+    state_path: Path,
+    guard: DestinationGuard,
 ) -> None:
-    source_stat = source.stat()
-    ensure_destination_parent(destination_root, destination, expected_device)
-    hardlink_key = f"{source_stat.st_dev}:{source_stat.st_ino}"
-    hardlinks: dict[str, str] = state_data["hardlinks"]
-    existing_relative = hardlinks.get(hardlink_key)
+    known_hash = state["file_sha256"].get(relative)
+    inode_key = f"{source_metadata.st_dev}:{source_metadata.st_ino}"
+    representative_relative = state["hardlinks"].get(inode_key)
 
-    if destination.exists() or destination.is_symlink():
-        if verified_existing_file(source, destination):
-            if existing_relative:
-                existing_relative_path = Path(existing_relative)
-                if existing_relative_path.is_absolute() or ".." in existing_relative_path.parts:
-                    raise MigrationError("Unsafe hardlink path in migration journal")
-                existing_destination = Path(state_data["destination"]) / existing_relative_path
-                if not is_within(
-                    existing_destination.resolve(strict=False),
-                    destination_root.resolve(strict=False),
-                ):
-                    raise MigrationError("Hardlink target escapes the destination directory")
-                if not existing_destination.is_file():
-                    raise MigrationError(f"Missing migrated hardlink target: {existing_destination}")
-                if destination.stat().st_ino != existing_destination.stat().st_ino:
-                    destination.unlink()
-                    os.link(existing_destination, destination)
-                    fsync_directory(destination.parent)
-            elif source_stat.st_nlink > 1:
-                hardlinks[hardlink_key] = relative_path.as_posix()
-            source.unlink()
-            recorder.completed(source_stat.st_size)
-            return
-        raise MigrationError(f"Conflicting destination file: {destination}")
-
-    if existing_relative:
-        existing_relative_path = Path(existing_relative)
-        if existing_relative_path.is_absolute() or ".." in existing_relative_path.parts:
-            raise MigrationError("Unsafe hardlink path in migration journal")
-        existing_destination = Path(state_data["destination"]) / existing_relative_path
-        if not is_within(existing_destination.resolve(strict=False), destination_root.resolve(strict=False)):
-            raise MigrationError("Hardlink target escapes the destination directory")
-        if not existing_destination.is_file():
-            raise MigrationError(f"Missing migrated hardlink target: {existing_destination}")
-        os.link(existing_destination, destination)
-        fsync_directory(destination.parent)
-        source.unlink()
-        recorder.completed(source_stat.st_size)
+    if lexists(destination_file):
+        matches, source_hash = destination_file_matches(source_file, destination_file, known_hash)
+        if not matches:
+            raise MigrationError(
+                f"Existing destination file differs; refusing overwrite / 目标已有不同文件，拒绝覆盖: {destination_file}"
+            )
+        state["file_sha256"][relative] = source_hash
+        if source_metadata.st_nlink > 1:
+            if representative_relative:
+                representative = destination / representative_relative
+                if representative.stat().st_ino != destination_file.stat().st_ino:
+                    raise MigrationError(f"Destination hardlink topology differs / 目标硬链接结构不一致: {relative}")
+            else:
+                state["hardlinks"][inode_key] = relative
         return
 
-    relative_digest = hashlib.sha256(relative_path.as_posix().encode("utf-8")).hexdigest()[:16]
-    temporary = destination.parent / f"{PARTIAL_PREFIX}{migration_id}-{relative_digest}.partial"
-    if temporary.exists() or temporary.is_symlink():
-        temporary.unlink()
+    guard.check()
+    if representative_relative:
+        representative = destination / representative_relative
+        if not representative.is_file() or representative.is_symlink():
+            raise MigrationError(f"Hardlink representative is unavailable / 硬链接代表文件不可用: {representative}")
+        os.link(str(representative), str(destination_file))
+        source_hash = state["file_sha256"].get(representative_relative) or sha256_file(source_file)
+        state["file_sha256"][relative] = source_hash
+    else:
+        migration_id = str(state["migration_id"])
+        partial = partial_path(destination_file, migration_id)
+        if lexists(partial):
+            prepare_owned_partial(partial, destination, migration_id)
 
-    result = subprocess.run(
-        ["/usr/bin/ditto", "--rsrc", "--extattr", "--acl", str(source), str(temporary)],
-        check=False,
-    )
-    if result.returncode != 0:
-        raise MigrationError(f"ditto failed while copying {source}")
+        before = metadata_signature(source_file.lstat())
+        ditto_copy_file(source_file, partial, work_root)
+        if not partial.is_file() or partial.is_symlink():
+            raise MigrationError(f"Partial copy is not a regular file / 临时副本不是普通文件: {partial}")
+        with partial.open("rb") as handle:
+            os.fsync(handle.fileno())
+        source_hash = sha256_file(source_file)
+        destination_hash = sha256_file(partial)
+        after = metadata_signature(source_file.lstat())
+        if before != after:
+            raise MigrationError(f"Source file changed while being copied / 复制时源文件发生变化: {relative}")
+        if source_hash != destination_hash:
+            raise MigrationError(f"SHA-256 mismatch / SHA-256 不一致: {relative}")
+        guard.check()
+        os.replace(str(partial), str(destination_file))
+        fsync_directory(destination_file.parent)
+        state["file_sha256"][relative] = source_hash
+        if source_metadata.st_nlink > 1:
+            state["hardlinks"][inode_key] = relative
 
-    with temporary.open("rb") as handle:
-        os.fsync(handle.fileno())
-
-    after_copy_stat = source.stat()
-    if not source_unchanged(source_stat, after_copy_stat):
-        temporary.unlink(missing_ok=True)
-        raise MigrationError(f"Source changed during copy: {source}")
-
-    if source_stat.st_size != temporary.stat().st_size or sha256_file(source) != sha256_file(temporary):
-        temporary.unlink(missing_ok=True)
-        raise MigrationError(f"SHA-256 verification failed: {source}")
-
-    os.replace(temporary, destination)
-    fsync_directory(destination.parent)
-    if source_stat.st_nlink > 1:
-        hardlinks[hardlink_key] = relative_path.as_posix()
-    source.unlink()
-    recorder.completed(source_stat.st_size)
+    state["progress"]["files"] += 1
+    state["progress"]["bytes"] += source_metadata.st_size
+    checkpoint_state(state_path, state)
 
 
-def stream_move(
+def seed_hardlink_representatives(
     source: Path,
     destination: Path,
-    state_file: Path,
-    state_data: dict[str, Any],
-    process_names: Iterable[str],
+    state: Dict[str, Any],
+    snapshot: Dict[str, Dict[str, Any]],
 ) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
-    expected_destination_device = destination.stat().st_dev
-    migration_id = state_data["migration_id"]
-    removed_partials = remove_own_partials(destination, migration_id)
-    if removed_partials:
-        print(f"Removed {removed_partials} incomplete temporary file(s) from an interrupted run")
+    """Use a verified surviving destination hardlink as the resume representative."""
+    for relative in sorted(snapshot):
+        expected = snapshot[relative]
+        if expected.get("type") != "file" or int(expected.get("nlink", 1)) <= 1:
+            continue
+        inode_key = f"{expected['device']}:{expected['inode']}"
+        if inode_key in state["hardlinks"]:
+            continue
+        source_file = source / relative
+        destination_file = destination / relative
+        if not destination_file.is_file() or destination_file.is_symlink():
+            continue
+        matches, source_hash = destination_file_matches(
+            source_file,
+            destination_file,
+            state["file_sha256"].get(relative),
+        )
+        if matches:
+            state["hardlinks"][inode_key] = relative
+            state["file_sha256"][relative] = source_hash
 
-    recorder = StateRecorder(state_file, state_data)
-    real_directories: list[Path] = []
-    last_process_check = 0.0
 
-    for current, directory_names, file_names in os.walk(source, topdown=True, followlinks=False):
-        guard_destination_root(destination, expected_destination_device)
-        if time.monotonic() - last_process_check >= 5:
-            check_processes(process_names)
-            last_process_check = time.monotonic()
-        current_path = Path(current)
-        real_directories.append(current_path)
-        directory_names.sort()
-        file_names.sort()
+def copy_tree(
+    source: Path,
+    destination: Path,
+    state: Dict[str, Any],
+    guard: DestinationGuard,
+) -> None:
+    snapshot = state["source_snapshot"]
+    # Rebuild hardlink representatives from destination entries on every run.
+    # A persisted representative may itself be the file missing after an interruption.
+    state["hardlinks"] = {}
+    migration_id = str(state["migration_id"])
+    work_root = destination.parent / f".{destination.name}.migrate-work-{migration_id}"
+    if lexists(work_root) and (work_root.is_symlink() or not work_root.is_dir()):
+        raise MigrationError(f"Invalid migration work directory / 迁移工作目录无效: {work_root}")
+    work_root.mkdir(mode=0o700, exist_ok=True)
+    state_path = state_path_for(destination)
 
-        for name in list(directory_names):
-            item = current_path / name
-            if item.is_symlink():
-                relative = item.relative_to(source)
-                copy_symlink(
-                    item,
-                    destination / relative,
-                    destination,
-                    expected_destination_device,
-                )
-                recorder.completed_symlink()
-                directory_names.remove(name)
+    if lexists(destination):
+        if destination.is_symlink() or not destination.is_dir():
+            raise MigrationError(f"Destination is not a real directory / 目标不是实体目录: {destination}")
+    else:
+        guard.check(force_slow=True)
+        destination.mkdir(mode=0o700)
+        fsync_directory(destination.parent)
 
-        for name in file_names:
-            if time.monotonic() - last_process_check >= 5:
-                check_processes(process_names)
-                last_process_check = time.monotonic()
-            item = current_path / name
-            relative = item.relative_to(source)
-            destination_item = destination / relative
-            item_mode = item.lstat().st_mode
-            if stat.S_ISLNK(item_mode):
-                copy_symlink(
-                    item,
-                    destination_item,
-                    destination,
-                    expected_destination_device,
-                )
-                recorder.completed_symlink()
-            elif stat.S_ISREG(item_mode):
+    seed_hardlink_representatives(source, destination, state, snapshot)
+
+    try:
+        for relative in sorted(snapshot):
+            if relative == ".":
+                continue
+            expected = snapshot[relative]
+            source_path = source / relative
+            destination_path = destination / relative
+            source_metadata = assert_snapshot_entry(relative, source_path, expected)
+            ensure_parent_directories(relative, source, destination, snapshot, guard)
+
+            if expected["type"] == "directory":
+                if lexists(destination_path):
+                    if destination_path.is_symlink() or not destination_path.is_dir():
+                        raise MigrationError(f"Destination type mismatch / 目标类型不匹配: {destination_path}")
+                else:
+                    guard.check()
+                    destination_path.mkdir(mode=0o700)
+            elif expected["type"] == "symlink":
+                target = str(expected["link_target"])
+                if lexists(destination_path):
+                    if not destination_path.is_symlink() or os.readlink(str(destination_path)) != target:
+                        raise MigrationError(f"Destination symlink differs / 目标软链接不一致: {destination_path}")
+                else:
+                    guard.check()
+                    os.symlink(target, str(destination_path))
+                    copy_symlink_metadata(source_path, destination_path)
+                    state["progress"]["symlinks"] += 1
+                    checkpoint_state(state_path, state)
+            elif expected["type"] == "file":
                 copy_regular_file(
-                    item,
-                    destination_item,
                     relative,
-                    migration_id,
-                    state_data,
-                    recorder,
+                    source_path,
+                    destination_path,
+                    source_metadata,
                     destination,
-                    expected_destination_device,
+                    work_root,
+                    state,
+                    state_path,
+                    guard,
                 )
             else:
-                raise MigrationError(f"Unsupported special file: {item}")
+                raise MigrationError(f"Special file is unsupported / 不支持特殊文件: {source_path}")
 
-    recorder.flush()
+        # Apply directory metadata last because creating children changes directory timestamps.
+        directory_relatives = [
+            relative for relative, record in snapshot.items() if record["type"] == "directory"
+        ]
+        for relative in sorted(directory_relatives, key=lambda item: item.count("/"), reverse=True):
+            source_dir = source if relative == "." else source / relative
+            destination_dir = destination if relative == "." else destination / relative
+            assert_snapshot_entry(relative, source_dir, snapshot[relative])
+            copy_directory_metadata(source_dir, destination_dir)
 
-    for source_directory in reversed(real_directories):
-        guard_destination_root(destination, expected_destination_device)
-        relative = source_directory.relative_to(source)
-        destination_directory = destination / relative
-        destination_directory.mkdir(parents=True, exist_ok=True)
-        shutil.copystat(source_directory, destination_directory, follow_symlinks=False)
-        if source_directory != source:
-            source_directory.rmdir()
-
-    source.rmdir()
-    if state_data["link_mode"] == "symlink":
-        source.symlink_to(destination, target_is_directory=True)
-        fsync_directory(source.parent)
-
-    final_stats = tree_stats(destination)
-    expected = state_data["initial_stats"]
-    comparable = ("files", "directories", "symlinks", "special", "bytes")
-    differences = [key for key in comparable if final_stats[key] != expected[key]]
-    if differences:
-        raise MigrationError("Final tree statistics differ for: " + ", ".join(differences))
-
-    state_data["status"] = "linked" if state_data["link_mode"] == "symlink" else "moved"
-    state_data["final_stats"] = final_stats
-    state_data["completed_at"] = int(time.time())
-    recorder.flush()
+        current_snapshot = source_snapshot(source)
+        if current_snapshot != snapshot:
+            raise MigrationError("Source tree changed during copy / 复制期间源目录发生变化")
+        guard.check(force_slow=True)
+    finally:
+        try:
+            work_root.rmdir()
+        except OSError:
+            pass
 
 
-def atomic_move(
-    source: Path,
-    destination: Path,
-    state_file: Path,
-    state_data: dict[str, Any],
-) -> None:
-    if destination.exists() or destination.is_symlink():
-        raise MigrationError(f"Atomic destination already exists: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    source.rename(destination)
-    if state_data["link_mode"] == "symlink":
-        source.symlink_to(destination, target_is_directory=True)
-        fsync_directory(source.parent)
-    state_data["status"] = "linked" if state_data["link_mode"] == "symlink" else "moved"
-    state_data["final_stats"] = state_data["initial_stats"]
-    state_data["completed_at"] = int(time.time())
-    write_state(state_file, state_data)
-
-
-def finalize_interrupted_move(
-    source: Path,
-    destination: Path,
-    state_file: Path,
-    state_data: dict[str, Any],
-) -> None:
-    if not destination.is_dir():
-        raise MigrationError("Cannot finalize: destination directory is missing")
-    final_stats = tree_stats(destination)
-    expected = state_data["initial_stats"]
-    comparable = ("files", "directories", "symlinks", "special", "bytes")
-    differences = [key for key in comparable if final_stats[key] != expected[key]]
-    if differences:
-        raise MigrationError("Cannot finalize; destination differs for: " + ", ".join(differences))
-
-    if state_data["link_mode"] == "symlink":
-        if source.is_symlink():
-            if not source_link_matches(source, destination):
-                raise MigrationError("Existing source symlink points to another destination")
-        elif source.exists():
-            raise MigrationError("Cannot finalize because the source path still exists")
-        else:
-            source.symlink_to(destination, target_is_directory=True)
-            fsync_directory(source.parent)
-    elif source.exists() or source.is_symlink():
-        raise MigrationError("Cannot finalize link-mode none because the source path still exists")
-
-    state_data["status"] = "linked" if state_data["link_mode"] == "symlink" else "moved"
-    state_data["final_stats"] = final_stats
-    state_data["completed_at"] = int(time.time())
-    state_data["updated_at"] = int(time.time())
-    write_state(state_file, state_data)
-
-
-def existing_parent_device(path: Path) -> int:
-    return nearest_existing_parent(path).stat().st_dev
-
-
-def command_audit(args: argparse.Namespace) -> int:
-    source = normalized_path(args.source)
-    destination = normalized_path(args.destination)
-    validate_pair(source, destination)
-
-    print(f"Source:      {source}")
-    print(f"Destination: {destination}")
-    if source.is_symlink():
-        print(f"Source is already a symlink -> {os.readlink(source)}")
-    elif source.is_dir():
-        source_stats = tree_stats(source)
-        print_stats("Source", source_stats)
-    else:
-        raise MigrationError(f"Source directory does not exist: {source}")
-
-    if destination.is_dir():
-        print_stats("Destination", tree_stats(destination))
-    elif destination.exists() or destination.is_symlink():
-        raise MigrationError(f"Destination exists but is not a directory: {destination}")
-    else:
-        print("Destination does not exist yet")
-
-    info = disk_info(destination)
-    print(
-        "Destination volume: "
-        f"{info.get('VolumeName', 'unknown')} "
-        f"({filesystem_name(info)}, {info.get('DeviceIdentifier', 'unknown')})"
+def command_copy(arguments: argparse.Namespace) -> None:
+    source = lexical_absolute(arguments.source)
+    destination = lexical_absolute(arguments.destination)
+    validate_source_and_destination(source, destination)
+    require_source_directory(source)
+    kind = resolve_kind(source, arguments.kind)
+    destination_info = require_destination_policy(
+        destination,
+        arguments.test_allow_internal_destination,
+        False,
     )
-    free = shutil.disk_usage(nearest_existing_parent(destination)).free
-    print(f"Destination free space: {human_bytes(free)}")
-    return 0
+    require_processes_stopped(arguments.process_name)
 
-
-def command_move(args: argparse.Namespace) -> int:
-    source = normalized_path(args.source)
-    destination = normalized_path(args.destination)
-    validate_pair(source, destination)
-    check_processes(args.process_name)
-
-    state_file = state_path_for(destination, args.state_file)
-    state_data = read_state(state_file)
-    destination_info: dict[str, Any] | None = None
-    if state_data:
-        check_state_paths(state_data, source, destination)
-        destination_info = ensure_apfs(destination, args.allow_non_apfs)
-        recorded_uuid = str(state_data.get("destination_volume_uuid") or "")
-        current_uuid = str(destination_info.get("VolumeUUID") or "")
-        if recorded_uuid and current_uuid and recorded_uuid != current_uuid:
-            raise MigrationError("The destination path is mounted from a different volume than the journal")
-
-    if source_link_matches(source, destination):
-        if state_data and state_data.get("status") not in {"linked", "moved"}:
-            if not args.execute:
-                print("Data is complete and linked; --execute would repair the journal status")
-                return 0
-            finalize_interrupted_move(source, destination, state_file, state_data)
-        print("Migration is already complete; source symlink points to destination")
-        return 0
-    if source.is_symlink():
-        raise MigrationError(f"Source is a symlink to another target: {source} -> {os.readlink(source)}")
-    if not source.exists() and state_data and state_data.get("status") == "moving":
-        if not args.execute:
-            print("Destination is complete; --execute would recreate the source link and finalize the journal")
-            return 0
-        finalize_interrupted_move(source, destination, state_file, state_data)
-        print("Finalized an interrupted migration after all data had moved")
-        return 0
-    if not source.is_dir():
-        raise MigrationError(f"Source directory does not exist: {source}")
-    if not destination.parent.is_dir():
+    stats = tree_stats(source)
+    if stats["special"]:
+        raise MigrationError("Source contains special files / 源目录包含不支持的特殊文件")
+    print_audit(source, destination, kind, stats, destination_info)
+    snapshot = source_snapshot(source)
+    existing_state = load_state(destination, required=False)
+    if existing_state is None and lexists(destination):
         raise MigrationError(
-            "Destination parent must already exist on the intended volume; create and verify it first"
+            "Destination already exists without this migration journal / 目标已存在但没有本次迁移日志"
         )
-    if destination.is_symlink():
-        raise MigrationError("Destination must not be a symlink")
-    if destination.exists() and not destination.is_dir():
-        raise MigrationError("Destination exists but is not a directory")
-
-    if destination_info is None:
-        destination_info = ensure_apfs(destination, args.allow_non_apfs)
-    if state_data:
-        if state_data.get("status") in {"linked", "moved"}:
-            print(f"Migration journal already reports {state_data['status']}")
-            return 0
-        initial_stats = state_data["initial_stats"]
+    if existing_state is not None:
+        validate_state(existing_state, source, destination, kind)
+        require_journal_destination(destination, existing_state)
+        state = existing_state
+        if state.get("status") not in {"copying", "copied", "verified", "linked"}:
+            raise MigrationError("Migration journal status is invalid / 迁移日志状态无效")
+        if snapshot != state.get("source_snapshot"):
+            raise MigrationError("Source differs from the saved start snapshot / 源目录与初始快照不一致")
     else:
-        if destination.exists() and any(destination.iterdir()):
-            raise MigrationError("Destination is not empty and no matching migration journal exists")
-        initial_stats = tree_stats(source)
-        if initial_stats["special"]:
-            raise MigrationError("Source contains sockets, devices, or other unsupported special files")
+        state = make_initial_state(
+            source,
+            destination,
+            kind,
+            disk_info(source),
+            destination_info,
+            stats,
+            snapshot,
+            arguments.test_allow_internal_destination,
+        )
 
-    source_device = source.stat().st_dev
-    destination_device = existing_parent_device(destination)
-    strategy = args.strategy
-    if strategy == "auto":
-        strategy = "atomic" if source_device == destination_device else "stream"
-    if strategy == "atomic" and source_device != destination_device:
-        raise MigrationError("Atomic move requires source and destination on the same filesystem")
+    existing_payload = 0
+    if destination.is_dir() and not destination.is_symlink():
+        existing_payload = min(stats["unique_bytes"], tree_stats(destination)["unique_bytes"])
+    remaining_payload = max(0, stats["unique_bytes"] - existing_payload)
+    required_free = remaining_payload + COPY_OVERHEAD_BYTES
+    print(f"  Remaining payload / 剩余数据: {format_bytes(remaining_payload)}")
+    print(f"  Required destination free / 目标所需可用空间: {format_bytes(required_free)}")
+    if int(destination_info["free_bytes"]) < required_free:
+        raise MigrationError("Not enough destination space / 目标空间不足")
 
-    print(f"Strategy: {strategy}")
-    print_stats("Initial source", initial_stats)
-    print(f"Destination filesystem: {filesystem_name(destination_info)}")
-    if strategy == "stream":
-        peak_extra = initial_stats["largest_file"] + 16 * 1024 * 1024
-        print(f"Bounded temporary overhead: approximately {human_bytes(peak_extra)} or less")
-        free = shutil.disk_usage(nearest_existing_parent(destination)).free
-        remaining_stats = tree_stats(source)
-        required_destination_space = remaining_stats.get("unique_bytes", remaining_stats["bytes"])
-        if free < required_destination_space:
-            raise MigrationError(
-                f"Destination needs about {human_bytes(required_destination_space)} free; "
-                f"only {human_bytes(free)} is available"
-            )
+    if not arguments.execute:
+        print("Dry run only; no files were written / 仅预演，未写入任何文件")
+        print("Re-run with --execute after reviewing the exact paths / 审核准确路径后添加 --execute")
+        return
 
-    if not args.execute:
-        print("Dry run only. Re-run with --execute after reviewing the exact paths and process list.")
-        if strategy == "stream":
-            print(f"Streaming mode also requires --confirm {CONFIRM_PHRASE}")
-        return 0
-    if strategy == "stream" and args.confirm != CONFIRM_PHRASE:
-        raise MigrationError(f"Streaming mode requires --confirm {CONFIRM_PHRASE}")
-
-    if state_data is None:
-        state_data = {
-            "schema_version": SCHEMA_VERSION,
-            "migration_id": uuid.uuid4().hex[:16],
-            "source": str(source),
-            "destination": str(destination),
-            "strategy": strategy,
-            "link_mode": args.link_mode,
-            "status": "moving",
-            "created_at": int(time.time()),
-            "updated_at": int(time.time()),
-            "initial_stats": initial_stats,
-            "progress": {"files": 0, "symlinks": 0, "bytes": 0},
-            "hardlinks": {},
-            "per_file_sha256": strategy == "stream",
-            "destination_volume_uuid": str(destination_info.get("VolumeUUID") or ""),
-        }
-        write_state(state_file, state_data)
-    elif state_data.get("strategy") != strategy or state_data.get("link_mode") != args.link_mode:
-        raise MigrationError("Resume must use the strategy and link mode recorded in the journal")
-
-    print(f"Journal: {state_file}")
-    if strategy == "atomic":
-        atomic_move(source, destination, state_file, state_data)
-    else:
-        stream_move(source, destination, state_file, state_data, args.process_name)
-    print("Migration completed")
-    return 0
+    guard = DestinationGuard(destination.parent, destination_info, arguments.process_name)
+    if existing_state is None:
+        write_state(state_path_for(destination), state)
+    copy_tree(source, destination, state, guard)
+    state["progress"] = {
+        "files": stats["files"],
+        "symlinks": stats["symlinks"],
+        "bytes": stats["logical_bytes"],
+    }
+    state["status"] = "copied"
+    state["copied_at"] = time.time()
+    write_state(state_path_for(destination), state)
+    print("Copy complete; source remains untouched / 复制完成，源目录保持不变")
+    print("Next: run verify before Finder handoff / 下一步：先运行 verify，再进入访达交接")
 
 
-def command_verify(args: argparse.Namespace) -> int:
-    source = normalized_path(args.source)
-    destination = normalized_path(args.destination)
-    validate_pair(source, destination)
-    state_file = state_path_for(destination, args.state_file)
-    state_data = read_state(state_file)
-    if not state_data:
-        raise MigrationError(f"Migration journal not found: {state_file}")
-    check_state_paths(state_data, source, destination)
-    if state_data.get("status") not in {"linked", "moved"}:
-        raise MigrationError(f"Migration is not complete; journal status is {state_data.get('status')}")
-    if not destination.is_dir():
-        raise MigrationError(f"Destination directory is missing: {destination}")
-
-    actual = tree_stats(destination)
-    expected = state_data["initial_stats"]
-    comparable = ("files", "directories", "symlinks", "special", "bytes")
-    differences = [key for key in comparable if actual[key] != expected[key]]
-    if differences:
-        raise MigrationError("Verification failed for: " + ", ".join(differences))
-    if state_data["link_mode"] == "symlink" and not source_link_matches(source, destination):
-        raise MigrationError("Source symlink does not point to destination")
-    if state_data["link_mode"] == "none" and source.exists():
-        raise MigrationError("Source still exists even though link mode is none")
-
-    partial_prefix = f"{PARTIAL_PREFIX}{state_data['migration_id']}-"
-    partials = [
-        Path(current) / name
-        for current, _, files in os.walk(destination)
-        for name in files
-        if name.startswith(partial_prefix) and name.endswith(".partial")
-    ]
-    if partials:
-        raise MigrationError(f"Found {len(partials)} incomplete temporary file(s)")
-
-    print_stats("Verified destination", actual)
-    print(f"Journal status: {state_data['status']}")
-    print(f"Per-file SHA-256 verification: {state_data.get('per_file_sha256', False)}")
-    print("Verification passed")
-    return 0
-
-
-def command_restore(args: argparse.Namespace) -> int:
-    original = normalized_path(args.source_link)
-    data = normalized_path(args.data)
-    validate_pair(original, data)
-    check_processes(args.process_name)
-
-    reverse_state_file = state_path_for(original, None)
-    reverse_state = read_state(reverse_state_file)
-    if reverse_state:
-        check_state_paths(reverse_state, data, original)
-        if reverse_state.get("status") == "moved" and original.is_dir() and not data.exists():
-            print("Data is already restored to the original directory")
-            return 0
-
-    linked = source_link_matches(original, data)
-    if not linked and not reverse_state:
-        raise MigrationError("Original path is not a symlink to the specified migrated data")
-    if data.exists() and not data.is_dir():
-        raise MigrationError(f"Migrated data is not a directory: {data}")
-    if not data.exists() and not reverse_state:
-        raise MigrationError(f"Migrated data is missing: {data}")
-    if not original.parent.is_dir():
-        raise MigrationError("Original parent directory is missing")
-
-    destination_info = disk_info(original.parent)
-    if "apfs" not in filesystem_name(destination_info).lower() and not args.allow_non_apfs:
-        raise MigrationError("Original destination is not APFS; review metadata risks before restoring")
-
-    if data.is_dir():
-        remaining_stats = tree_stats(data)
-        print_stats("Data to restore", remaining_stats)
-        required = remaining_stats.get("unique_bytes", remaining_stats["bytes"])
-        available = shutil.disk_usage(original.parent).free
-        print(f"Original volume free space: {human_bytes(available)}")
-        if available < required:
-            raise MigrationError(
-                f"Original volume needs about {human_bytes(required)} free; only {human_bytes(available)} is available"
-            )
-    print(f"Restore from: {data}")
-    print(f"Restore to:   {original}")
-
-    if not args.execute:
-        print(f"Dry run only. Re-run with --execute --confirm {RESTORE_CONFIRM_PHRASE}")
-        return 0
-    if args.confirm != RESTORE_CONFIRM_PHRASE:
-        raise MigrationError(f"Restore requires --confirm {RESTORE_CONFIRM_PHRASE}")
-
-    removed_link = False
-    if linked:
-        original.unlink()
-        fsync_directory(original.parent)
-        removed_link = True
-
-    move_args = argparse.Namespace(
-        source=str(data),
-        destination=str(original),
-        strategy="auto",
-        link_mode="none",
-        process_name=args.process_name,
-        state_file=None,
-        allow_non_apfs=args.allow_non_apfs,
-        execute=True,
-        confirm=CONFIRM_PHRASE,
-    )
+def xattr_map(path: Path, follow_symlinks: bool) -> Dict[str, str]:
+    result: Dict[str, str] = {}
     try:
-        result = command_move(move_args)
-    except Exception:
-        if removed_link and not reverse_state_file.exists() and not original.exists():
-            original.symlink_to(data, target_is_directory=True)
-            fsync_directory(original.parent)
-        raise
-    print("Restore completed")
+        names = os.listxattr(str(path), follow_symlinks=follow_symlinks)
+    except (AttributeError, OSError):
+        return result
+    for name in sorted(names):
+        try:
+            value = os.getxattr(str(path), name, follow_symlinks=follow_symlinks)
+        except OSError as error:
+            raise MigrationError(f"Cannot read extended attribute {name}: {path}: {error}") from error
+        result[name] = hashlib.sha256(value).hexdigest()
     return result
+
+
+def verification_record(path: Path, metadata: os.stat_result) -> Dict[str, Any]:
+    kind = file_type(metadata.st_mode)
+    record: Dict[str, Any] = {
+        "type": kind,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "flags": getattr(metadata, "st_flags", 0),
+        "xattrs": xattr_map(path, follow_symlinks=False),
+        "acl": acl_entries(path),
+    }
+    if kind != "symlink":
+        record["mtime_ns"] = metadata.st_mtime_ns
+    if kind == "file":
+        record["size"] = metadata.st_size
+    elif kind == "symlink":
+        record["link_target"] = os.readlink(str(path))
+    return record
+
+
+def full_verify(source: Path, destination: Path) -> Dict[str, str]:
+    source_entries = {relative: (path, metadata) for relative, path, metadata in iter_tree(source)}
+    destination_entries = {
+        relative: (path, metadata) for relative, path, metadata in iter_tree(destination)
+    }
+    if set(source_entries) != set(destination_entries):
+        missing = sorted(set(source_entries) - set(destination_entries))[:10]
+        extra = sorted(set(destination_entries) - set(source_entries))[:10]
+        raise MigrationError(f"Tree entries differ / 目录条目不一致; missing={missing}, extra={extra}")
+
+    hashes: Dict[str, str] = {}
+    source_hardlinks: Dict[Tuple[int, int], List[str]] = {}
+    for relative in sorted(source_entries):
+        source_path, source_metadata = source_entries[relative]
+        destination_path, destination_metadata = destination_entries[relative]
+        source_record = verification_record(source_path, source_metadata)
+        destination_record = verification_record(destination_path, destination_metadata)
+        if source_record != destination_record:
+            raise MigrationError(f"Metadata differs / 元数据不一致: {relative}")
+        if source_record["type"] == "file":
+            source_hash = sha256_file(source_path)
+            destination_hash = sha256_file(destination_path)
+            if source_hash != destination_hash:
+                raise MigrationError(f"SHA-256 mismatch / SHA-256 不一致: {relative}")
+            hashes[relative] = source_hash
+            if source_metadata.st_nlink > 1:
+                source_hardlinks.setdefault(
+                    (source_metadata.st_dev, source_metadata.st_ino), []
+                ).append(relative)
+
+    for relatives in source_hardlinks.values():
+        destination_inodes = {
+            destination_entries[relative][1].st_ino for relative in relatives
+        }
+        if len(destination_inodes) != 1:
+            raise MigrationError(
+                "Hardlink topology differs / 硬链接结构不一致: " + ", ".join(relatives)
+            )
+    return hashes
+
+
+def verify_app_signature(app: Path) -> None:
+    result = subprocess.run(
+        ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise MigrationError(
+            "Destination app signature verification failed / 目标应用签名校验失败: "
+            + result.stderr.strip()
+        )
+
+
+def command_verify(arguments: argparse.Namespace) -> None:
+    source = lexical_absolute(arguments.source)
+    destination = lexical_absolute(arguments.destination)
+    validate_source_and_destination(source, destination)
+    require_source_directory(source)
+    if destination.is_symlink() or not destination.is_dir():
+        raise MigrationError(f"Destination directory not found / 找不到目标目录: {destination}")
+    state = load_state(destination)
+    assert state is not None
+    validate_state(state, source, destination)
+    require_journal_destination(destination, state)
+    if state.get("status") not in {"copied", "verified", "linked"}:
+        raise MigrationError("Copy has not completed / 复制尚未完成")
+
+    hashes = full_verify(source, destination)
+    if state.get("kind") == "app":
+        verify_app_signature(destination)
+    state["file_sha256"] = hashes
+    state["status"] = "linked" if state.get("status") == "linked" else "verified"
+    state["verified_at"] = time.time()
+    state["full_verification"] = {
+        "all_regular_files_sha256": True,
+        "metadata": True,
+        "xattrs": True,
+        "acls": True,
+        "hardlinks": True,
+        "codesign": state.get("kind") == "app",
+    }
+    write_state(state_path_for(destination), state)
+    print("Full verification passed / 完整校验通过")
+    print("Source remains untouched / 源目录保持不变")
+
+
+def validate_reveal_path(source: Path, requested: Optional[str]) -> Path:
+    if requested is None:
+        return source
+    candidate = lexical_absolute(requested)
+    if candidate == source:
+        return candidate
+    if candidate.parent != source.parent or not candidate.name.startswith(source.name):
+        raise MigrationError(
+            "Reveal path must be the source or its explicitly named sibling backup / "
+            "访达定位路径只能是源路径或同级、以原名开头的备份"
+        )
+    return candidate
+
+
+def command_reveal(arguments: argparse.Namespace) -> None:
+    source = lexical_absolute(arguments.source)
+    destination = lexical_absolute(arguments.destination)
+    validate_source_and_destination(source, destination)
+    state = load_state(destination)
+    assert state is not None
+    validate_state(state, source, destination)
+    if destination.is_symlink() or not destination.is_dir():
+        raise MigrationError("Verified destination is unavailable / 已校验目标不可用")
+    require_journal_destination(destination, state)
+    if state.get("status") not in {"verified", "linked"}:
+        raise MigrationError("Full verification is required first / 必须先完成完整校验")
+    reveal_path = validate_reveal_path(source, arguments.path)
+    if not lexists(reveal_path):
+        raise MigrationError(f"Path to reveal does not exist / 要在访达定位的路径不存在: {reveal_path}")
+
+    print(f"Finder handoff / 访达交接: {reveal_path}")
+    if state.get("kind") == "app":
+        print("First launch and smoke-test the external app. Then move the internal app to Trash in Finder.")
+        print("请先启动并实测外接盘应用；确认正常后，再在访达中把内置应用移到废纸篓。")
+    else:
+        print(f"In Finder, rename the source to: {source.name}.internal-backup")
+        print(f"请在访达中把源目录重命名为：{source.name}.internal-backup")
+        print("Return here only after Finder finishes. The tool will not delete or rename it.")
+        print("访达完成后再返回；本工具不会删除或重命名该目录。")
+    if not arguments.print_only:
+        subprocess.run(["/usr/bin/open", "-R", str(reveal_path)], check=True)
+
+
+def command_link(arguments: argparse.Namespace) -> None:
+    source = lexical_absolute(arguments.source)
+    destination = lexical_absolute(arguments.destination)
+    validate_source_and_destination(source, destination)
+    state = load_state(destination)
+    assert state is not None
+    validate_state(state, source, destination)
+    if state.get("kind") == "app":
+        raise MigrationError("App bundles should launch from the external volume; no source link is created / 应用应直接从外接盘启动，不建立原路径软链接")
+    if state.get("status") not in {"verified", "linked"}:
+        raise MigrationError("Full verification is required before linking / 建立链接前必须完成完整校验")
+    if not destination.is_dir() or destination.is_symlink():
+        raise MigrationError("Verified destination is unavailable / 已校验目标不可用")
+    require_journal_destination(destination, state)
+
+    if source.is_symlink():
+        if source.resolve(strict=False) == destination.resolve(strict=True):
+            state["status"] = "linked"
+            write_state(state_path_for(destination), state)
+            print("Source link already points to destination / 原路径软链接已指向目标")
+            return
+        raise MigrationError("A different source symlink already exists / 原路径已有其他软链接")
+    if lexists(source):
+        raise MigrationError(
+            "Source still exists. Rename it manually in Finder first; this tool will not remove it / "
+            "源路径仍存在；请先在访达中手动重命名，本工具不会移除它"
+        )
+    if not source.parent.is_dir() or source.parent.is_symlink():
+        raise MigrationError("Source parent is unavailable / 源路径上级目录不可用")
+    if not os.access(str(source.parent), os.W_OK):
+        raise MigrationError(
+            "Source parent is not user-writable; do not use sudo / 当前用户不可写入源路径上级目录，请勿使用 sudo"
+        )
+
+    print(f"Link / 链接: {source} -> {destination}")
+    print("This creates only a small symlink; it does not delete the Finder backup / 仅建立小型软链接，不删除访达备份")
+    if not arguments.execute:
+        print("Dry run only / 仅预演；审核后添加 --execute")
+        return
+    os.symlink(str(destination), str(source))
+    state["status"] = "linked"
+    state["linked_at"] = time.time()
+    write_state(state_path_for(destination), state)
+    print("Link created. Keep the Finder backup until the app passes a real smoke test / 链接已建立；应用实测通过前请保留访达备份")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Migrate a macOS app-data directory with bounded temporary disk usage."
+        description="Copy and verify macOS app data without deleting the source / 复制并校验 macOS 应用数据，绝不删除源文件"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    def add_paths(target: argparse.ArgumentParser) -> None:
-        target.add_argument("--source", required=True, help="Exact current app-data directory")
-        target.add_argument("--destination", required=True, help="Exact new data directory")
-
-    audit = subparsers.add_parser("audit", help="Read-only path, size, and filesystem audit")
-    add_paths(audit)
+    audit = subparsers.add_parser("audit", help="read-only audit / 只读审计")
+    audit.add_argument("--source", required=True)
+    audit.add_argument("--destination", required=True)
+    audit.add_argument("--kind", choices=("auto", "app", "data"), default="auto")
     audit.set_defaults(handler=command_audit)
 
-    move = subparsers.add_parser("move", help="Plan or execute a resumable migration")
-    add_paths(move)
-    move.add_argument("--strategy", choices=("auto", "atomic", "stream"), default="auto")
-    move.add_argument("--link-mode", choices=("symlink", "none"), default="symlink")
-    move.add_argument("--process-name", action="append", default=[], help="Exact process name that must be stopped")
-    move.add_argument("--state-file", help="Optional journal path")
-    move.add_argument("--allow-non-apfs", action="store_true", help="Allow a destination that may lose macOS metadata")
-    move.add_argument("--execute", action="store_true", help="Perform the migration")
-    move.add_argument("--confirm", help=f"Required phrase for streaming mode: {CONFIRM_PHRASE}")
-    move.set_defaults(handler=command_move)
+    copy = subparsers.add_parser("copy", help="copy to destination without source deletion / 复制到目标但不删除源")
+    copy.add_argument("--source", required=True)
+    copy.add_argument("--destination", required=True)
+    copy.add_argument("--kind", choices=("auto", "app", "data"), default="auto")
+    copy.add_argument("--process-name", action="append", default=[])
+    copy.add_argument("--test-allow-internal-destination", action="store_true", help=argparse.SUPPRESS)
+    copy.add_argument("--execute", action="store_true")
+    copy.set_defaults(handler=command_copy)
 
-    verify = subparsers.add_parser("verify", help="Verify final tree and source link against the journal")
-    add_paths(verify)
-    verify.add_argument("--state-file", help="Optional journal path")
+    verify = subparsers.add_parser("verify", help="full source-to-destination verification / 完整源目标校验")
+    verify.add_argument("--source", required=True)
+    verify.add_argument("--destination", required=True)
     verify.set_defaults(handler=command_verify)
 
-    restore = subparsers.add_parser(
-        "restore",
-        help="Move migrated data back to the original path with the same bounded-space algorithm",
-    )
-    restore.add_argument("--source-link", required=True, help="Original path currently linked to migrated data")
-    restore.add_argument("--data", required=True, help="Current migrated data directory")
-    restore.add_argument("--process-name", action="append", default=[], help="Exact process name that must be stopped")
-    restore.add_argument("--allow-non-apfs", action="store_true")
-    restore.add_argument("--execute", action="store_true")
-    restore.add_argument("--confirm", help=f"Required phrase: {RESTORE_CONFIRM_PHRASE}")
-    restore.set_defaults(handler=command_restore)
+    reveal = subparsers.add_parser("reveal", help="reveal source or backup in Finder / 在访达定位源或备份")
+    reveal.add_argument("--source", required=True)
+    reveal.add_argument("--destination", required=True)
+    reveal.add_argument("--path")
+    reveal.add_argument("--print-only", action="store_true")
+    reveal.set_defaults(handler=command_reveal)
+
+    link = subparsers.add_parser("link", help="create a symlink after manual Finder rename / 访达手动重命名后建立软链接")
+    link.add_argument("--source", required=True)
+    link.add_argument("--destination", required=True)
+    link.add_argument("--execute", action="store_true")
+    link.set_defaults(handler=command_link)
     return parser
 
 
 def main() -> int:
     parser = build_parser()
-    args = parser.parse_args()
     try:
-        return int(args.handler(args))
+        arguments = parser.parse_args()
+        arguments.handler(arguments)
+        return 0
     except MigrationError as error:
-        eprint(f"error: {error}")
+        eprint(f"Safety stop / 安全停止: {error}")
         return 2
     except KeyboardInterrupt:
-        eprint("Interrupted. Re-run the same command to resume from the journal.")
+        eprint("Interrupted safely; source was not deleted / 已安全中断，源数据未被删除")
         return 130
+    except subprocess.CalledProcessError as error:
+        eprint(f"Command failed / 命令失败: {error}")
+        return 2
 
 
 if __name__ == "__main__":

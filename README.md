@@ -1,66 +1,174 @@
-# macOS App Data Migrator Skill
+# macOS App & Data Migrator Skill
 
-一个面向 Codex 的开源 Skill，用于把 macOS 应用或游戏的大型数据目录迁移到其他内置盘或外接盘，并尽量降低迁移过程中的临时磁盘占用。
+一个中英双语的 Codex Skill，用于在内置盘几乎没有可用空间时，把一个明确的 macOS 程序或程序数据目录迁移到外接 APFS，同时保留可验证的无损回退点。
 
-它不是“把整个 `~/Library` 搬走”的脚本。Skill 会先识别精确数据边界和应用沙盒状态，再选择应用原生设置、普通软链接或专用安全书签适配器。
+A bilingual Codex Skill for migrating one precisely scoped macOS application or app-data directory to external APFS when the internal disk has almost no free space, while retaining a verifiable lossless rollback point.
 
-## 空间模型
+## 中文说明
 
-| 场景 | 策略 | 峰值额外占用 |
-|---|---|---:|
-| 同一文件系统 | 原子目录移动 | 接近 0 |
-| 跨文件系统 | 逐文件复制、fsync、SHA-256 校验后删除源文件 | 最大单个文件 + 约 16 MiB |
+### 这个项目解决什么
 
-目标磁盘仍需容纳最终数据。跨磁盘复制不可能做到任何时刻绝对零额外字节，但本项目不会自动制作一份完整备份、压缩包或第三份副本。
+传统“移动”脚本往往会边复制边删除源文件，或者先在内置盘生成压缩包/临时副本。这个 Skill 使用更严格的五段式流程：
 
-## 功能
+```text
+只读审计 → 只向外接盘复制 → 源与目标完整校验 → 访达手动交接 → 真实运行验收
+```
 
-- 只读检查应用 bundle、沙盒 entitlement、运行进程和常见数据目录。
-- APFS 与路径范围保护，拒绝 `/`、用户主目录、整个 `~/Library` 或容器根目录等宽泛目标。
-- 同盘原子移动和跨盘可恢复流式迁移。
-- 每个普通文件落盘后执行 SHA-256 校验，再删除对应源文件。
-- 保留符号链接、硬链接、ACL、扩展属性和 resource fork。
-- 使用小型 JSON 日志恢复中断操作。
-- 提供鸣潮 / Wuthering Waves 的源码级安全书签启动器适配器。
-- 不包含任何预编译程序、本机用户名、卷 UUID 或用户数据。
+- 内置源程序和源数据全程只读；迁移器没有源删除、源移动或自动恢复命令。
+- 迁移日志、临时副本、Swift 构建目录和缓存全部位于目标外接盘。
+- 每个普通文件都做 SHA-256，完整校验还比较目录树、权限、ACL、扩展属性、resource fork、软链接和硬链接。
+- `.app` 额外执行严格深层代码签名校验。
+- 删除内置副本时，工具只在访达中定位；用户亲自在访达中重命名或移到废纸篓。
+- 不请求管理员密码、不使用 `sudo`，不用终端命令删除内置程序或数据。
+- 对沙盒程序不假设软链接可用；没有原生位置设置或已验证适配器时停止并保留源文件。
 
-## 安装到 Codex
+### 接近 0 空间的含义
 
-把 Skill 目录复制或链接到 Codex Skills 目录：
+迁移不会把用户负载或工具临时文件写入内置盘。目标外接盘必须有完整最终容量和约 64 MiB 工具余量。若程序数据需要保留原路径，最终会建立一个只占极少元数据的软链接。
+
+macOS 自己仍可能写少量日志、TCC 权限记录、安全书签或偏好设置，因此“操作系统绝对 0 字节写入”无法诚实保证；本项目保证的是不主动在内置盘创建迁移负载、完整副本或构建缓存。
+
+迁移不是备份：清倒内置盘废纸篓后，外接副本会成为唯一工作副本。本项目能防止迁移流程丢失数据，不能防止之后的外接盘物理损坏；重要数据仍应有独立备份。
+
+### 为什么不会自动删除源文件
+
+数据一致不等于程序兼容。完整校验通过后，仍需真实测试启动、读取、写入、退出、重启和更新器。保留内置源文件直到行为测试完成，才可能同时满足“数据无丢失”和“迁移后正常运行”。
+
+对于数据目录，用户先在访达中把源目录改名为 `.internal-backup`，工具再建立软链接；测试失败时可在访达中移除链接并把备份改回原名，无需重新复制整份数据。
+
+### 支持的组件
+
+- 可直接从外接宗卷运行的 macOS `.app`
+- 程序原生支持指定位置的媒体库、下载、模型、游戏资源等大型目录
+- 已实测支持软链接的非沙盒程序数据
+- 有专用文件夹授权适配器的沙盒程序
+- 鸣潮 / Wuthering Waves 的源码级安全作用域启动器
+
+默认拒绝整个 `~/Library`、整个容器、活动数据库、同步根目录、非 APFS 目标以及未明确识别为外接的目标宗卷。
+
+### 安装与使用
+
+将仓库克隆到任意位置，然后把 Skill 目录链接到 Codex：
 
 ```bash
 ln -s "/absolute/path/macos-app-data-migrator/skills/migrate-macos-app-data" \
   "$HOME/.codex/skills/migrate-macos-app-data"
 ```
 
-随后使用：
+在 Codex 中调用：
 
 ```text
-$migrate-macos-app-data 帮我把某个应用的大型数据迁移到外接 APFS 硬盘
+$migrate-macos-app-data 帮我把这个程序及其大型数据迁移到外接 APFS；内置盘接近 0 空间，删除只能由我在访达中执行。
 ```
 
-Codex 会先进行只读盘点，并在跨盘流式迁移真正删除源文件前要求明确确认。
+Skill 会先只读审计，再逐步停在每个真实审查门槛。不要从 README 中复制示例路径直接执行；所有路径都必须来自当前机器的只读发现。
 
-## 鸣潮适配器
+### 鸣潮适配器
 
-鸣潮 macOS 版本受 App Sandbox 约束，普通软链接不能单独解决外接资源访问。本仓库包含一个可从源码生成的小型启动器：用户在系统文件夹选择器中授权外接 `Resources` 目录，启动器把安全作用域传给游戏，并在资源建立文件句柄后自动关闭无害的文件夹提示。
+鸣潮 macOS 版受 App Sandbox 约束，普通软链接无法单独授予游戏访问外接资源的权限。仓库包含一个从 Swift 源码构建的小型启动器：用户通过系统文件夹选择器授权外接 `Resources`，启动器把安全作用域交给游戏，并在资源句柄建立后关闭无害提示。
 
-生成的 `.app` 会嵌入用户自己的绝对路径并使用 ad-hoc 签名，因此已被 `.gitignore` 排除，不应提交到公共仓库。
+构建必须显式指定外接输出路径；编译缓存和临时目录同样位于该外接宗卷。生成的 `.app` 含本机绝对路径和 ad-hoc 签名，已被忽略，不能提交到 GitHub。
 
-## 开发与验证
+### 开发验证
 
 ```bash
+python3 -m py_compile \
+  skills/migrate-macos-app-data/scripts/migrate_app_data.py \
+  skills/migrate-macos-app-data/scripts/inspect_app.py
+
+zsh -n skills/migrate-macos-app-data/scripts/build_wuthering_waves_launcher.sh
 python3 -m unittest discover -s tests -v
-python3 /path/to/skill-creator/scripts/quick_validate.py \
-  skills/migrate-macos-app-data
+
+xcrun swiftc -parse-as-library -typecheck \
+  -framework AppKit \
+  -framework ApplicationServices \
+  skills/migrate-macos-app-data/assets/wuthering-waves-launcher/main.swift
 ```
 
-测试覆盖路径保护、只读 dry-run、同盘原子移动、跨盘算法的强制流式模拟、中断续传、硬链接/符号链接保持，以及 Swift 启动器源码构建和签名。
+测试在隔离临时目录中模拟 Finder 改名和目标文件损坏；生产迁移器本身不提供删除源文件的命令。
 
-## 安全提示
+## English documentation
 
-流式模式会在每个文件验证完成后逐步删除源文件，因此属于破坏性操作。不要用于仍在运行的应用、活动数据库、同步目录或尚未证明兼容方式的沙盒应用。执行前请阅读 Skill 内的兼容性和恢复文档。
+### What this project solves
+
+Conventional “move” tools often delete source files while copying or stage an archive/temporary duplicate internally. This Skill uses five explicit gates:
+
+```text
+read-only audit → external-only copy → full source/destination verification → Finder handoff → live acceptance
+```
+
+- The internal source app/data remains read-only. The migrator has no source-delete, source-move, or automatic-restore command.
+- Journals, partial copies, Swift build directories, and caches stay on the target external volume.
+- Every regular file is SHA-256 checked; full verification also compares the tree, permissions, ACLs, extended attributes, resource forks, symlinks, and hardlinks.
+- An `.app` additionally receives strict deep code-signature verification.
+- For internal cleanup, the helper only reveals the exact item in Finder. The user personally renames it or moves it to Trash.
+- It never requests an administrator password, uses `sudo`, or deletes internal app/data paths from Terminal.
+- It does not assume a symlink crosses an app sandbox. Without a native location setting or tested adapter, it stops with the source intact.
+
+### What “near-zero free space” means
+
+No user payload or tool temporary data is intentionally written internally. The external volume needs the final dataset capacity plus roughly 64 MiB of tool headroom. Original-path compatibility may require one tiny symlink on the internal filesystem.
+
+macOS may still write small logs, TCC records, security bookmarks, or preferences. Literal zero-byte OS writes cannot honestly be guaranteed; the enforceable guarantee is that this project creates no migration payload, full duplicate, or build cache internally.
+
+Migration is not backup. After the internal Trash is emptied, the external copy becomes the sole working copy. This project protects the transition from data loss, not a later physical failure of the external disk; important data still needs an independent backup.
+
+### Why source deletion is manual
+
+Byte identity is not application compatibility. After full verification, the app still needs real launch, read, write, quit, relaunch, and updater testing. Keeping the internal source through that gate is what makes data-loss protection and post-migration operation compatible.
+
+For a data directory, the user first renames the source to `.internal-backup` in Finder. The helper then creates a symlink. If testing fails, the user removes that link and restores the backup name in Finder without copying the full dataset again.
+
+### Supported components
+
+- macOS `.app` bundles that permit external-volume execution
+- Large libraries, downloads, models, or game resources with an app-native location setting
+- Non-sandboxed app data with a proven symlink integration
+- Sandboxed data with a purpose-built folder-authorization adapter
+- The included source-level Wuthering Waves / 鸣潮 security-scoped launcher
+
+The default policy rejects all of `~/Library`, whole containers, live databases, sync roots, non-APFS destinations, and volumes that are not explicitly identified as external.
+
+### Install and invoke
+
+Clone the repository anywhere, then link its Skill directory into Codex using the command in the Chinese section. Invoke it with:
+
+```text
+$migrate-macos-app-data Move this app and its large data to external APFS. Internal free space is nearly zero, and only I may remove the internal copies in Finder.
+```
+
+The Skill begins read-only and pauses at every real review gate. Never copy example paths blindly; derive all paths from live read-only discovery.
+
+### Wuthering Waves adapter
+
+The macOS game is App Sandbox constrained, so a plain symlink does not independently grant external-resource access. The included Swift launcher asks the user to authorize the exact external `Resources` directory, passes its security scope to the game, and dismisses the harmless folder warning after resource handles are established.
+
+The builder requires an explicit external output. Its compiler cache and temporary directory stay on that same external volume. A generated `.app` embeds local absolute paths and an ad-hoc signature, is ignored by Git, and must never be published.
+
+### Development validation
+
+Run the commands in the Chinese section. The test suite covers source immutability, dry-run behavior, copy resume, full hashing, metadata, hardlinks, symlinks, destination tampering, Finder handoff, launcher build/signing, app-copy signature verification, and the absence of source-deletion CLI commands.
+
+## Repository layout / 仓库结构
+
+```text
+skills/migrate-macos-app-data/
+├── SKILL.md
+├── agents/openai.yaml
+├── assets/wuthering-waves-launcher/main.swift
+├── references/                 # paired 中文 / English guides
+└── scripts/
+    ├── inspect_app.py
+    ├── migrate_app_data.py
+    └── build_wuthering_waves_launcher.sh
+tests/
+REVIEW_CHECKLIST.md
+```
+
+## Review before publication / 发布前审查
+
+Please work through [REVIEW_CHECKLIST.md](REVIEW_CHECKLIST.md). The repository should not be pushed or published until the owner explicitly confirms the review.
 
 ## License
 
-MIT
+[MIT](LICENSE)

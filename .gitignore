@@ -4,5 +4,11 @@ __pycache__/
 *.app/
 dist/
 build/
+.build/
+.swiftpm/
 *.partial
+.*.partial
+.*.migrate-work-*
+.migrate-launcher-build.*
 .*.migrate-macos-app-data.json
+.*.migrate-macos-app-data.json.*.tmp

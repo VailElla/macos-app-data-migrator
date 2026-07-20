@@ -51,8 +51,8 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
         let runningGames = NSRunningApplication.runningApplications(withBundleIdentifier: gameBundleIdentifier)
         guard runningGames.isEmpty else {
             showAlert(
-                title: "Wuthering Waves is already running",
-                message: "Quit the game completely, then open this launcher again."
+                title: "鸣潮正在运行 / Wuthering Waves is running",
+                message: "请完全退出游戏，再重新打开此启动器。\nQuit the game completely, then open this launcher again."
             )
             NSApp.terminate(nil)
             return
@@ -66,8 +66,8 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
         guard accessibilityPermissionIsAvailable() else {
             requestAccessibilityPermission()
             showAlert(
-                title: "Accessibility permission required once",
-                message: "Enable this launcher in System Settings → Privacy & Security → Accessibility, then open it again. The permission is used only to dismiss the harmless folder warning."
+                title: "需要一次辅助功能权限 / Accessibility permission required",
+                message: "请在 系统设置 → 隐私与安全性 → 辅助功能 中启用此启动器，然后重新打开。该权限只用于关闭无害的文件夹提示。\nEnable this launcher in System Settings → Privacy & Security → Accessibility, then open it again. The permission is used only to dismiss the harmless folder warning."
             )
             NSApp.terminate(nil)
             return
@@ -93,7 +93,10 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: gameURL.path, isDirectory: &isDirectory),
               isDirectory.boolValue else {
-            showAlert(title: "Game not found", message: "Expected app: \(gameURL.path)")
+            showAlert(
+                title: "找不到游戏 / Game not found",
+                message: "预期应用路径 / Expected app: \(gameURL.path)"
+            )
             return false
         }
         return true
@@ -142,9 +145,9 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         let panel = NSOpenPanel()
-        panel.title = "Authorize external Wuthering Waves resources"
-        panel.message = "Select this exact Resources folder: \(resourcesURL.path)"
-        panel.prompt = "Authorize This Folder"
+        panel.title = "授权外接鸣潮资源 / Authorize external Wuthering Waves resources"
+        panel.message = "请选择这个准确的 Resources 文件夹 / Select this exact Resources folder:\n\(resourcesURL.path)"
+        panel.prompt = "授权此文件夹 / Authorize"
         panel.directoryURL = resourcesURL
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -153,18 +156,27 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
         panel.resolvesAliases = true
 
         guard panel.runModal() == .OK, let selectedURL = panel.url else {
-            showAlert(title: "Resources not authorized", message: "The game was not launched.")
+            showAlert(
+                title: "资源未授权 / Resources not authorized",
+                message: "游戏没有启动。\nThe game was not launched."
+            )
             return nil
         }
         guard isExpectedResourcesDirectory(selectedURL) else {
-            showAlert(title: "Wrong folder", message: "Select exactly: \(resourcesURL.path)")
+            showAlert(
+                title: "文件夹不正确 / Wrong folder",
+                message: "请准确选择 / Select exactly: \(resourcesURL.path)"
+            )
             return nil
         }
 
         _ = selectedURL.startAccessingSecurityScopedResource()
         securityScopedResourcesURL = selectedURL
         guard verifyResourcesDirectory(selectedURL) else {
-            showAlert(title: "Resources unavailable", message: "macOS still cannot read the selected folder.")
+            showAlert(
+                title: "资源不可用 / Resources unavailable",
+                message: "macOS 仍无法读取所选文件夹。\nmacOS still cannot read the selected folder."
+            )
             return nil
         }
 
@@ -172,7 +184,10 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
             try saveResourcesBookmark(for: selectedURL)
         } catch {
             logger.error("Unable to save folder authorization: \(error.localizedDescription, privacy: .public)")
-            showAlert(title: "Authorization was not saved", message: error.localizedDescription)
+            showAlert(
+                title: "授权未保存 / Authorization was not saved",
+                message: error.localizedDescription
+            )
             return nil
         }
         return selectedURL
@@ -231,7 +246,10 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 guard task.terminationStatus == 0 else {
-                    self.showAlert(title: "Launch failed", message: "The macOS open command failed.")
+                    self.showAlert(
+                        title: "启动失败 / Launch failed",
+                        message: "macOS open 命令失败。\nThe macOS open command failed."
+                    )
                     NSApp.terminate(nil)
                     return
                 }
@@ -242,7 +260,7 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
         do {
             try openTask.run()
         } catch {
-            showAlert(title: "Launch failed", message: error.localizedDescription)
+            showAlert(title: "启动失败 / Launch failed", message: error.localizedDescription)
             NSApp.terminate(nil)
         }
     }
@@ -268,7 +286,10 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
             }
             if Date() >= self.gameLaunchDeadline {
                 timer.invalidate()
-                self.showAlert(title: "Launch failed", message: "Timed out waiting for the game process.")
+                self.showAlert(
+                    title: "启动失败 / Launch failed",
+                    message: "等待游戏进程超时。\nTimed out waiting for the game process."
+                )
                 NSApp.terminate(nil)
             }
         }
@@ -382,7 +403,7 @@ final class WutheringWavesExternalLauncher: NSObject, NSApplicationDelegate {
         alert.alertStyle = .warning
         alert.messageText = title
         alert.informativeText = message
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "好 / OK")
         alert.runModal()
     }
 }
