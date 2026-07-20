@@ -22,17 +22,21 @@
 2. After explicit authorization, Codex moves the source to Trash through Finder without emptying Trash and never substitutes a Terminal command. Use `Name.internal-backup` only when the user explicitly prefers a sibling backup.
 3. Confirm that the original path is free and the trashed source still supports Put Back (or that the sibling backup remains), then dry-run `link`.
 4. Execute `link --execute` only after the user reviews both exact paths. It creates only a symlink.
-5. Keep the backup through real read, write, full quit, relaunch, and updater tests.
+5. Keep the recovery copy in Trash (or the sibling backup) through real read, write, full quit, relaunch, and updater tests.
 6. Confirm that new writes land externally and no new large internal directory appears.
 7. After the user confirms success, explain that the internal source in Trash may be permanently deleted. Emptying Trash requires a fresh action-time confirmation and must not silently remove unrelated items.
 8. For a sibling backup, run `reveal --path "/exact/Name.internal-backup"` before moving it to Trash.
 
-Migration is not backup. After Trash is emptied, the external disk is the sole working copy. A later physical disk failure is outside the migration-integrity guarantee, so important data needs an independent backup.
+Migration is not backup. After the internal recovery copy in Trash is permanently deleted, the external disk is the sole working copy. A later physical disk failure is outside the migration-integrity guarantee, so important data needs an independent backup.
 
 ## Confirmation wording
 
-Before releasing the final internal space, say clearly:
+For the default Trash handoff, say clearly:
 
-> The external copy passed full verification, and the app passed read, write, quit, and relaunch tests. Finder now selects the internal backup `[exact path]`; the external destination is `[exact path]`. Moving it to Trash makes rollback depend on the external copy. Please confirm whether you will perform this action in Finder.
+> The external copy `[exact destination]` passed full verification and the app passed read, write, quit, and relaunch tests. The original internal source `[exact source]` is already in Trash and still supports Put Back. Permanently deleting that exact item removes this rollback; Empty Trash would also delete every other item currently there. Please confirm whether you want to perform the permanent deletion in Finder.
 
-Without that explicit confirmation, retain the backup and end the run.
+For the explicitly selected sibling-backup handoff, say clearly:
+
+> The external copy `[exact destination]` passed full verification and the app passed read, write, quit, and relaunch tests. Finder now selects the sibling backup `[exact backup]`. Moving it to Trash preserves rollback only until that exact item is permanently deleted. Please confirm whether you want to move this backup to Trash in Finder.
+
+Without the confirmation matching the actual handoff state, retain the recovery copy and end the run. Never empty unrelated Trash contents automatically.

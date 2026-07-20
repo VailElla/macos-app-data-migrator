@@ -61,4 +61,4 @@ log show --last 3m --style compact \
   --predicate 'eventMessage CONTAINS[c] "WutheringWaves"' | grep -Ei 'deny|sandbox'
 ```
 
-Rebuilding changes the ad-hoc code hash, so macOS may require toggling the Accessibility entry. Only after the live gates pass should the Finder handoff handle internal `Resources.internal-backup` or the internal game `.app`.
+Rebuilding changes the ad-hoc code hash, so macOS may require toggling the Accessibility entry. Only after the live gates pass should the Finder handoff handle the exact internal `Resources` source (Trash by default; `Resources.internal-backup` only when explicitly selected) or the internal game `.app`.

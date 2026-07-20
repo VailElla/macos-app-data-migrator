@@ -57,6 +57,18 @@ class SkillStructureTests(unittest.TestCase):
     def test_low_space_and_finder_safety_contract_is_present(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         migrator = (SKILL_ROOT / "scripts" / "migrate_app_data.py").read_text(encoding="utf-8")
+        recovery_en = (SKILL_ROOT / "references" / "recovery.en.md").read_text(encoding="utf-8")
+        recovery_zh = (SKILL_ROOT / "references" / "recovery.zh-CN.md").read_text(encoding="utf-8")
+        finder_en = (SKILL_ROOT / "references" / "finder-handoff.en.md").read_text(encoding="utf-8")
+        finder_zh = (SKILL_ROOT / "references" / "finder-handoff.zh-CN.md").read_text(encoding="utf-8")
+        wuthering_en = (SKILL_ROOT / "references" / "wuthering-waves.en.md").read_text(
+            encoding="utf-8"
+        )
+        wuthering_zh = (SKILL_ROOT / "references" / "wuthering-waves.zh-CN.md").read_text(
+            encoding="utf-8"
+        )
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        checklist = (REPO_ROOT / "REVIEW_CHECKLIST.md").read_text(encoding="utf-8")
         builder = (SKILL_ROOT / "scripts" / "build_wuthering_waves_launcher.sh").read_text(
             encoding="utf-8"
         )
@@ -84,6 +96,25 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("应用名（外接版）", skill)
         self.assertIn("App Name (External)", skill)
         self.assertIn('b"com.apple.metadata:kMDItemFinderComment"', migrator)
+        self.assertIn('kind == "app" and relative == "."', migrator)
+        self.assertIn("普通数据与应用内部条目仍严格比较全部 xattr", skill)
+        self.assertIn("ordinary data and app descendants retain strict xattr checks", skill)
+        self.assertIn("默认在用户明确授权后由 Codex 通过访达", readme)
+        self.assertIn("after explicit authorization Codex normally moves", readme)
+        self.assertNotIn("用户先在访达中把源目录改名", readme)
+        self.assertNotIn("the user first renames the source", readme)
+        self.assertIn("数据目录默认经访达移入废纸篓", checklist)
+        self.assertIn("A data directory normally stays in Trash", checklist)
+        self.assertIn("choosing Put Back", recovery_en)
+        self.assertIn("执行“放回原处”", recovery_zh)
+        self.assertIn("is already in Trash", finder_en)
+        self.assertIn("已在废纸篓中", finder_zh)
+        self.assertIn("Trash by default", wuthering_en)
+        self.assertIn("only when explicitly selected", wuthering_en)
+        self.assertIn("默认移到废纸篓", wuthering_zh)
+        self.assertIn("只有明确选择时才使用", wuthering_zh)
+        self.assertIn("move it to Trash by default", migrator)
+        self.assertNotIn("Rename it manually in Finder first", migrator)
         self.assertNotIn('add_parser("move"', migrator)
         self.assertNotIn('add_parser("restore"', migrator)
         self.assertNotIn("$HOME", builder)

@@ -1111,35 +1111,52 @@ def command_copy(arguments: argparse.Namespace) -> None:
     print("Next: run verify before Finder handoff / 下一步：先运行 verify，再进入访达交接")
 
 
-VERIFICATION_IGNORED_XATTRS = {
-    # macOS can attach or rewrite these system-managed attributes during a
-    # cross-volume copy or first launch. Finder comments are an intentional
-    # instance label. None of these are source payload metadata that should
-    # remain byte-identical across migrated instances.
-    b"com.apple.macl",
-    b"com.apple.metadata:kMDItemFinderComment",
-    b"com.apple.provenance",
-    b"com.apple.quarantine",
-}
+APP_ROOT_INSTANCE_LOCAL_XATTRS = frozenset(
+    {
+        # macOS can attach or rewrite these system-managed attributes during a
+        # cross-volume app copy or first launch. Finder comments are an
+        # intentional instance label. The exception is deliberately limited
+        # to the app-bundle root; data migrations and app descendants retain
+        # strict payload-xattr comparison.
+        b"com.apple.macl",
+        b"com.apple.metadata:kMDItemFinderComment",
+        b"com.apple.provenance",
+        b"com.apple.quarantine",
+    }
+)
 
 
-def xattr_map(path: Path, follow_symlinks: bool) -> Dict[str, str]:
+def verification_ignored_xattrs(kind: str, relative: str) -> frozenset[bytes]:
+    if kind == "app" and relative == ".":
+        return APP_ROOT_INSTANCE_LOCAL_XATTRS
+    return frozenset()
+
+
+def xattr_map(
+    path: Path,
+    follow_symlinks: bool,
+    ignored_names: frozenset[bytes] = frozenset(),
+) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for name in list_xattr_names(path, follow_symlinks):
-        if name in VERIFICATION_IGNORED_XATTRS:
+        if name in ignored_names:
             continue
         value = read_xattr(path, name, follow_symlinks)
         result[name.hex()] = hashlib.sha256(value).hexdigest()
     return result
 
 
-def verification_record(path: Path, metadata: os.stat_result) -> Dict[str, Any]:
+def verification_record(
+    path: Path,
+    metadata: os.stat_result,
+    ignored_xattrs: frozenset[bytes] = frozenset(),
+) -> Dict[str, Any]:
     kind = file_type(metadata.st_mode)
     record: Dict[str, Any] = {
         "type": kind,
         "mode": stat.S_IMODE(metadata.st_mode),
         "flags": getattr(metadata, "st_flags", 0),
-        "xattrs": xattr_map(path, follow_symlinks=False),
+        "xattrs": xattr_map(path, follow_symlinks=False, ignored_names=ignored_xattrs),
         "acl": acl_text(path),
     }
     if kind != "symlink":
@@ -1168,6 +1185,7 @@ def collect_verification_entries(root: Path) -> Dict[str, Tuple[Path, os.stat_re
 
 def verification_stability_snapshot(
     entries: Dict[str, Tuple[Path, os.stat_result]],
+    kind: str,
 ) -> Dict[str, Dict[str, Any]]:
     snapshot: Dict[str, Dict[str, Any]] = {}
     for relative in sorted(entries):
@@ -1179,7 +1197,11 @@ def verification_stability_snapshot(
                 raise MigrationError(
                     f"Tree changed while being inspected / 检查时目录树发生变化: {relative}"
                 )
-            record = verification_record(path, before)
+            record = verification_record(
+                path,
+                before,
+                ignored_xattrs=verification_ignored_xattrs(kind, relative),
+            )
             after_signature = stability_signature(path.lstat())
         except OSError as error:
             raise MigrationError(
@@ -1237,7 +1259,9 @@ def hardlink_topology(
     return sorted(topology)
 
 
-def full_verify(source: Path, destination: Path) -> Dict[str, str]:
+def full_verify(source: Path, destination: Path, kind: str = "data") -> Dict[str, str]:
+    if kind not in {"app", "data"}:
+        raise MigrationError(f"Invalid verification kind / 无效校验类型: {kind}")
     source_entries = collect_verification_entries(source)
     destination_entries = collect_verification_entries(destination)
     if set(source_entries) != set(destination_entries):
@@ -1245,8 +1269,8 @@ def full_verify(source: Path, destination: Path) -> Dict[str, str]:
         extra = sorted(set(destination_entries) - set(source_entries))[:10]
         raise MigrationError(f"Tree entries differ / 目录条目不一致; missing={missing}, extra={extra}")
 
-    source_before = verification_stability_snapshot(source_entries)
-    destination_before = verification_stability_snapshot(destination_entries)
+    source_before = verification_stability_snapshot(source_entries, kind)
+    destination_before = verification_stability_snapshot(destination_entries, kind)
     source_topology = hardlink_topology(source_entries, require_destination_isolation=False)
     destination_topology = hardlink_topology(destination_entries, require_destination_isolation=True)
     if source_topology != destination_topology:
@@ -1271,8 +1295,8 @@ def full_verify(source: Path, destination: Path) -> Dict[str, str]:
                 raise MigrationError(f"SHA-256 mismatch / SHA-256 不一致: {relative}")
             hashes[relative] = source_hash
 
-    source_after = verification_stability_snapshot(collect_verification_entries(source))
-    destination_after = verification_stability_snapshot(collect_verification_entries(destination))
+    source_after = verification_stability_snapshot(collect_verification_entries(source), kind)
+    destination_after = verification_stability_snapshot(collect_verification_entries(destination), kind)
     if source_after != source_before:
         raise MigrationError("Source changed during verification / 校验期间源目录发生变化")
     if destination_after != destination_before:
@@ -1315,7 +1339,7 @@ def command_verify(arguments: argparse.Namespace) -> None:
         raise MigrationError("Migration journal process list is invalid / 迁移日志进程列表无效")
     require_processes_stopped(process_names)
 
-    hashes = full_verify(source, destination)
+    hashes = full_verify(source, destination, str(state["kind"]))
     if state.get("kind") == "app":
         verify_app_signature(destination)
     state["file_sha256"] = hashes
@@ -1405,8 +1429,10 @@ def command_link(arguments: argparse.Namespace) -> None:
         raise MigrationError("A different source symlink already exists / 原路径已有其他软链接")
     if lexists(source):
         raise MigrationError(
-            "Source still exists. Rename it manually in Finder first; this tool will not remove it / "
-            "源路径仍存在；请先在访达中手动重命名，本工具不会移除它"
+            "Source still exists. Complete the authorized Finder handoff first: move it to Trash by default, "
+            "or use the explicitly selected sibling backup; this tool will not remove it / "
+            "源路径仍存在；请先完成已授权的访达交接：默认移到废纸篓，或使用明确选择的同级备份；"
+            "本工具不会移除源路径"
         )
     if not source.parent.is_dir() or source.parent.is_symlink():
         raise MigrationError("Source parent is unavailable / 源路径上级目录不可用")

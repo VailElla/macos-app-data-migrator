@@ -14,11 +14,11 @@ A bilingual Codex Skill for migrating one precisely scoped macOS application or 
 只读审计 → 只向外接盘复制 → 源与目标完整校验 → 访达手动交接 → 真实运行验收
 ```
 
-- 内置源程序和源数据全程只读；迁移器没有源删除、源移动或自动恢复命令。
+- 复制与校验阶段把内置源程序和源数据视为只读；迁移器没有源删除、源移动或自动恢复命令，后续交接只通过访达完成。
 - 迁移日志、临时副本、Swift 构建目录和缓存全部位于目标外接盘。
-- 每个普通文件都做 SHA-256，完整校验还比较目录树、权限、ACL、扩展属性、resource fork、软链接和硬链接。
+- 每个普通文件都做 SHA-256，完整校验还比较目录树、权限、ACL、扩展属性、resource fork、软链接和硬链接；只有 `.app` 根目录上明确记录的 macOS 实例属性允许不同，普通数据与应用内部负载仍严格比较。
 - `.app` 额外执行严格深层代码签名校验。
-- 删除内置副本时，工具只在访达中定位；用户亲自在访达中重命名或移到废纸篓。
+- 删除内置 `.app` 时，工具只在访达中定位并由用户亲自移到废纸篓。数据目录默认在用户明确授权后，由 Codex 通过访达移到废纸篓但不清空；用户明确偏好时才改用同级 `.internal-backup`。
 - 不请求管理员密码、不使用 `sudo`，不用终端命令删除内置程序或数据。
 - 对沙盒程序不假设软链接可用；没有原生位置设置或已验证适配器时停止并保留源文件。
 
@@ -30,13 +30,13 @@ macOS 自己仍可能写少量日志、TCC 权限记录、安全书签或偏好�
 
 程序自身也可能在真实启动时重新生成着色器、索引等派生缓存。它们不是迁移副本，但会真实占用内置空间；发布前和每次迁移验收都应单独测量并披露，不能把“迁移负载外置”等同于“程序运行时零增长”。
 
-迁移不是备份：清倒内置盘废纸篓后，外接副本会成为唯一工作副本。本项目能防止迁移流程丢失数据，不能防止之后的外接盘物理损坏；重要数据仍应有独立备份。
+迁移不是备份：在访达中永久删除废纸篓里的内置源后，外接副本会成为唯一工作副本。本项目能防止迁移流程丢失数据，不能防止之后的外接盘物理损坏；重要数据仍应有独立备份。
 
-### 为什么不会自动删除源文件
+### 为什么迁移器不会自动删除源文件
 
 数据一致不等于程序兼容。完整校验通过后，仍需真实测试启动、读取、写入、退出、重启和更新器。保留内置源文件直到行为测试完成，才可能同时满足“数据无丢失”和“迁移后正常运行”。
 
-对于数据目录，用户先在访达中把源目录改名为 `.internal-backup`，工具再建立软链接；测试失败时可在访达中移除链接并把备份改回原名，无需重新复制整份数据。
+对于数据目录，默认在用户明确授权后由 Codex 通过访达把准确源目录移到废纸篓但不清空，再由迁移器建立软链接；测试失败时，先在访达中移除链接，再对废纸篓中的源执行“放回原处”。只有用户明确偏好同级备份时，才把源改名为 `.internal-backup` 并在失败时恢复原名。两种回滚都无需重新复制整份数据。
 
 ### 支持的组件
 
@@ -60,7 +60,7 @@ ln -s "/absolute/path/macos-app-data-migrator/skills/migrate-macos-app-data" \
 在 Codex 中调用：
 
 ```text
-$migrate-macos-app-data 帮我把这个程序及其大型数据迁移到外接 APFS；内置盘接近 0 空间，删除只能由我在访达中执行。
+$migrate-macos-app-data 帮我把这个程序及其大型数据迁移到外接 APFS；内置盘接近 0 空间，所有交接都使用访达、必须先取得我的明确授权，并且绝不自动清空废纸篓。
 ```
 
 Skill 会先只读审计，再逐步停在每个真实审查门槛。不要从 README 中复制示例路径直接执行；所有路径都必须来自当前机器的只读发现。
@@ -88,7 +88,7 @@ xcrun swiftc -sdk "$macos_sdk_path" -parse-as-library -typecheck \
   skills/migrate-macos-app-data/assets/wuthering-waves-launcher/main.swift
 ```
 
-测试使用一次性的外接 APFS RAM 宗卷承载目标副本、迁移日志、partial、构建目录和编译缓存；内置临时目录中只有很小的测试源夹具，并且不会接触当前真实迁移结果。测试覆盖真实 xattr/ACL 复制与篡改拒绝、软链接祖先路径拒绝、Finder 改名和目标文件损坏；生产迁移器本身不提供删除源文件的命令或内部宗卷绕过参数。
+测试使用一次性的外接 APFS RAM 宗卷承载目标副本、迁移日志、partial、构建目录和编译缓存；内置临时目录中只有很小的测试源夹具，并且不会接触当前真实迁移结果。测试覆盖真实 xattr/ACL 复制与篡改拒绝、软链接祖先路径拒绝、访达废纸篓/同级备份交接和目标文件损坏；生产迁移器本身不提供删除源文件的命令或内部宗卷绕过参数。
 
 ## English documentation
 
@@ -100,11 +100,11 @@ Conventional “move” tools often delete source files while copying or stage a
 read-only audit → external-only copy → full source/destination verification → Finder handoff → live acceptance
 ```
 
-- The internal source app/data remains read-only. The migrator has no source-delete, source-move, or automatic-restore command.
+- The internal source app/data remains read-only during copy and verification. The migrator has no source-delete, source-move, or automatic-restore command; the later handoff occurs only through Finder.
 - Journals, partial copies, Swift build directories, and caches stay on the target external volume.
-- Every regular file is SHA-256 checked; full verification also compares the tree, permissions, ACLs, extended attributes, resource forks, symlinks, and hardlinks.
+- Every regular file is SHA-256 checked; full verification also compares the tree, permissions, ACLs, extended attributes, resource forks, symlinks, and hardlinks. Only explicitly documented macOS instance attributes on the `.app` root may differ; ordinary data and app descendants remain strict.
 - An `.app` additionally receives strict deep code-signature verification.
-- For internal cleanup, the helper only reveals the exact item in Finder. The user personally renames it or moves it to Trash.
+- For an internal `.app`, the helper only reveals the exact item and the user moves it to Trash. For a data directory, after explicit authorization Codex normally moves the exact source to Trash through Finder without emptying Trash; a sibling `.internal-backup` is used only when the user explicitly prefers it.
 - It never requests an administrator password, uses `sudo`, or deletes internal app/data paths from Terminal.
 - It does not assume a symlink crosses an app sandbox. Without a native location setting or tested adapter, it stops with the source intact.
 
@@ -116,13 +116,13 @@ macOS may still write small logs, TCC records, security bookmarks, or preference
 
 The app itself may also regenerate derived shaders, indexes, or other caches during a real launch. These are not migration copies, but they consume real internal space and must be measured and disclosed separately; external-only migration payload does not mean zero runtime growth.
 
-Migration is not backup. After the internal Trash is emptied, the external copy becomes the sole working copy. This project protects the transition from data loss, not a later physical failure of the external disk; important data still needs an independent backup.
+Migration is not backup. After the internal source in Trash is permanently deleted, the external copy becomes the sole working copy. This project protects the transition from data loss, not a later physical failure of the external disk; important data still needs an independent backup.
 
-### Why source deletion is manual
+### Why the migrator never deletes source content automatically
 
 Byte identity is not application compatibility. After full verification, the app still needs real launch, read, write, quit, relaunch, and updater testing. Keeping the internal source through that gate is what makes data-loss protection and post-migration operation compatible.
 
-For a data directory, the user first renames the source to `.internal-backup` in Finder. The helper then creates a symlink. If testing fails, the user removes that link and restores the backup name in Finder without copying the full dataset again.
+For a data directory, after explicit authorization Codex normally moves the exact source to Trash through Finder without emptying Trash, and the helper then creates a symlink. If testing fails, remove the link in Finder and choose Put Back for the original source. Use a sibling `.internal-backup` only when the user explicitly prefers it; that fallback restores the original name. Neither recovery path recopies the full dataset.
 
 ### Supported components
 
@@ -139,7 +139,7 @@ The default policy rejects all of `~/Library`, whole containers, live databases,
 Clone the repository anywhere, then link its Skill directory into Codex using the command in the Chinese section. Invoke it with:
 
 ```text
-$migrate-macos-app-data Move this app and its large data to external APFS. Internal free space is nearly zero, and only I may remove the internal copies in Finder.
+$migrate-macos-app-data Move this app and its large data to external APFS. Internal free space is nearly zero; use Finder for every handoff, require my explicit authorization, and never empty Trash automatically.
 ```
 
 The Skill begins read-only and pauses at every real review gate. Never copy example paths blindly; derive all paths from live read-only discovery.

@@ -21,7 +21,7 @@ This checklist is the GitHub publication gate. The repository owner should revie
 ## 3. 数据完整性 / Data integrity
 
 - [ ] 每个普通文件复制时和完整验证时都比较 SHA-256。 / Every regular file receives SHA-256 comparison during copy and full verification.
-- [ ] 完整验证覆盖目录树、类型、权限、ACL、扩展属性/resource fork、软链接和硬链接。 / Full verification covers the tree, types, permissions, ACLs, extended attributes/resource forks, symlinks, and hardlinks.
+- [ ] 完整验证覆盖目录树、类型、权限、ACL、扩展属性/resource fork、软链接和硬链接；只有 `.app` 根目录上明确记录的实例属性允许不同。 / Full verification covers the tree, types, permissions, ACLs, extended attributes/resource forks, symlinks, and hardlinks; only documented instance attributes on the `.app` root may differ.
 - [ ] `.app` 目标执行 `codesign --verify --deep --strict`。 / App destinations receive strict deep signature verification.
 - [ ] 目标已有不同文件时拒绝覆盖。 / A differing pre-existing destination file is never overwritten.
 - [ ] 中断后可使用相同日志与命令续传，源仍保持不变。 / The same journal and command resume an interruption while the source remains unchanged.
@@ -30,10 +30,10 @@ This checklist is the GitHub publication gate. The repository owner should revie
 
 - [ ] 不在内置盘生成压缩包、磁盘镜像、完整副本、迁移日志、partial 或编译缓存。 / No archive, disk image, full copy, journal, partial, or compiler cache is created internally.
 - [ ] 不请求管理员密码，不使用 `sudo`。 / No administrator password or `sudo` is used.
-- [ ] 内置 `.app` 和数据备份只由用户在访达中移到废纸篓。 / Only the user moves internal apps/data backups to Trash in Finder.
-- [ ] 文档说明只有用户在访达中清倒废纸篓后才释放空间，并说明迁移不等于独立备份。 / Docs explain that Finder Trash must be emptied to release space and that migration is not an independent backup.
+- [ ] 内置 `.app` 只由用户在访达中移到废纸篓；数据目录只在用户明确授权后由 Codex 通过访达移入废纸篓，且绝不自动清空。 / Only the user moves an internal app to Trash; Codex may move a data directory through Finder only after explicit authorization and never empties Trash automatically.
+- [ ] 文档说明只有在访达中永久删除废纸篓里的内置源后才释放空间，并说明迁移不等于独立备份。 / Docs explain that space is released only after the internal source in Trash is permanently deleted in Finder and that migration is not an independent backup.
 - [ ] 工具只用 `open -R` 定位路径，不用终端删除命令代替用户。 / The helper uses only `open -R` for selection and never substitutes a Terminal deletion.
-- [ ] 数据目录先在访达中改名为 `.internal-backup`，实测成功后才清理。 / A data directory is renamed to `.internal-backup` in Finder and retained through live testing.
+- [ ] 数据目录默认经访达移入废纸篓并保留到实测完成；只有用户明确偏好时才使用同级 `.internal-backup`。 / A data directory normally stays in Trash through live testing; a sibling `.internal-backup` is used only when the user explicitly prefers it.
 
 ## 5. 运行兼容 / Runtime compatibility
 

@@ -22,9 +22,9 @@ It records exact paths, the starting source-tree snapshot, progress, hardlink ma
 - A SHA-256, metadata, ACL, extended-attribute, or signature failure blocks Finder cleanup.
 - If the user eventually abandons the external copy, the user may manage those external generated files in Finder. Never substitute a Terminal deletion of the internal source.
 
-## Finder rename completed, link not yet created
+## Finder handoff completed, link not yet created
 
-To cancel, the user renames `Name.internal-backup` to its original name in Finder. No source data must be copied back from external storage.
+For the default Trash handoff, cancel by selecting the exact original data directory in Trash and choosing Put Back. Confirm that the original path is restored before launching the app. If the user selected a sibling backup instead, rename `Name.internal-backup` to its original name in Finder. No source data must be copied back from external storage in either case.
 
 ## Symlink created, app behavior test failed
 
@@ -40,7 +40,7 @@ This rollback requires neither an administrator password nor a Terminal deletion
 
 Launch the internal `.app` again. Do not move or delete it. If the user abandons the external copy, the user can manage that external `.app` in Finder.
 
-## Backup already moved to Trash
+## Source or sibling backup already in Trash
 
 - Trash not emptied: the user chooses Put Back in Finder, then follows the symlink rollback steps.
 - Trash emptied: preserve the only external copy. Returning it internally requires enough final capacity and a separately reviewed copy workflow; this skill does not pretend to provide lossless restoration into insufficient space.

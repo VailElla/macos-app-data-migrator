@@ -61,4 +61,4 @@ log show --last 3m --style compact \
   --predicate 'eventMessage CONTAINS[c] "WutheringWaves"' | grep -Ei 'deny|sandbox'
 ```
 
-启动器重建后，ad-hoc code hash 会改变。macOS 可能要求先关闭再开启辅助功能条目。只有完成以上实测，才按访达交接文档处理内置 `Resources.internal-backup` 或内置游戏 `.app`。
+启动器重建后，ad-hoc code hash 会改变。macOS 可能要求先关闭再开启辅助功能条目。只有完成以上实测，才按访达交接文档处理准确的内置 `Resources` 源目录（默认移到废纸篓；只有明确选择时才使用 `Resources.internal-backup`）或内置游戏 `.app`。

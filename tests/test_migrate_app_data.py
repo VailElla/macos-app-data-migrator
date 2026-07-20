@@ -430,7 +430,9 @@ class MigrationTests(unittest.TestCase):
                 "link", "--source", str(source), "--destination", str(destination), "--execute", check=False
             )
             self.assertEqual(refused.returncode, 2)
-            self.assertIn("Rename it manually in Finder", refused.stderr)
+            self.assertIn("Complete the authorized Finder handoff first", refused.stderr)
+            self.assertIn("move it to Trash by default", refused.stderr)
+            self.assertIn("explicitly selected sibling backup", refused.stderr)
             self.assertTrue(source.is_dir())
 
             reveal = run_migrator(
@@ -656,33 +658,74 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(refused.returncode, 2)
             self.assertIn("Metadata differs", refused.stderr)
 
-    def test_verification_ignores_instance_local_system_xattrs(self) -> None:
+    def test_verification_ignores_instance_xattrs_only_on_app_root(self) -> None:
         path = Path("/tmp/example.app")
         finder_comment = b"com.apple.metadata:kMDItemFinderComment"
         macl = b"com.apple.macl"
         provenance = b"com.apple.provenance"
         quarantine = b"com.apple.quarantine"
         application_metadata = b"com.example.application-metadata"
+        all_names = [finder_comment, macl, provenance, quarantine, application_metadata]
         with mock.patch.object(
             MIGRATOR_MODULE,
             "list_xattr_names",
-            return_value=[finder_comment, macl, provenance, quarantine, application_metadata],
+            return_value=all_names,
         ), mock.patch.object(
             MIGRATOR_MODULE,
             "read_xattr",
             return_value=b"preserved-value",
-        ) as read_xattr:
-            result = MIGRATOR_MODULE.xattr_map(path, follow_symlinks=False)
+        ):
+            data_result = MIGRATOR_MODULE.xattr_map(
+                path,
+                follow_symlinks=False,
+                ignored_names=MIGRATOR_MODULE.verification_ignored_xattrs("data", "."),
+            )
+            app_root_result = MIGRATOR_MODULE.xattr_map(
+                path,
+                follow_symlinks=False,
+                ignored_names=MIGRATOR_MODULE.verification_ignored_xattrs("app", "."),
+            )
+            app_child_result = MIGRATOR_MODULE.xattr_map(
+                path,
+                follow_symlinks=False,
+                ignored_names=MIGRATOR_MODULE.verification_ignored_xattrs("app", "Contents/MacOS/App"),
+            )
 
         self.assertEqual(
-            result,
+            app_root_result,
             {
                 application_metadata.hex(): hashlib.sha256(
                     b"preserved-value"
                 ).hexdigest()
             },
         )
-        read_xattr.assert_called_once_with(path, application_metadata, False)
+        self.assertEqual(set(data_result), {name.hex() for name in all_names})
+        self.assertEqual(set(app_child_result), {name.hex() for name in all_names})
+
+    def test_full_verify_limits_instance_xattr_exceptions_to_app_root(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-root-xattr-") as temporary:
+            root = Path(temporary)
+            source = root / "Source.app"
+            destination = root / "Destination.app"
+            write_file(source / "Contents" / "Info.plist", b"identical app payload")
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+
+            write_xattr(source, "com.apple.quarantine", b"source-instance")
+            write_xattr(destination, "com.apple.quarantine", b"destination-instance")
+            MIGRATOR_MODULE.full_verify(source, destination, kind="app")
+
+            write_xattr(
+                source / "Contents" / "Info.plist",
+                "com.apple.quarantine",
+                b"source-payload-metadata",
+            )
+            write_xattr(
+                destination / "Contents" / "Info.plist",
+                "com.apple.quarantine",
+                b"destination-payload-metadata",
+            )
+            with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Metadata differs"):
+                MIGRATOR_MODULE.full_verify(source, destination, kind="app")
 
     def test_acls_are_copied_and_tampering_blocks_verification(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-acl-") as temporary:
