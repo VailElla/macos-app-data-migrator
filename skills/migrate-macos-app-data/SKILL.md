@@ -76,7 +76,7 @@ python3 scripts/migrate_app_data.py reveal \
 
 ### 4B. 数据目录的访达交接
 
-完整校验后运行 `reveal`。让用户在访达中把原目录重命名为 `原名.internal-backup`；重命名不会复制数据，也不会额外占用等量内置空间。用户明确确认访达操作完成后，预演并建立一个很小的软链接：
+完整校验后运行 `reveal`。默认让用户在访达中把原目录重命名为 `原名.internal-backup`；如果用户明确要求 Codex 代办，Codex 应使用访达界面完成这个可回滚的同卷改名，并在操作前后核对准确源路径与备份路径，不能把改名再次交还给用户，也不能改用终端 `mv`。重命名不会复制数据，也不会额外占用等量内置空间。确认访达操作完成后，预演并建立一个很小的软链接：
 
 ```bash
 python3 scripts/migrate_app_data.py link \
@@ -139,7 +139,7 @@ Keep the real `.app` filename unless updater compatibility with renaming has bee
 
 ### 4B. Finder handoff for a data directory
 
-After full verification, run `reveal` and ask the user to rename the original directory to `Name.internal-backup` in Finder. Renaming on the same internal filesystem does not duplicate its data. After the user explicitly confirms Finder has finished, dry-run and execute `link`. If the app uses a native location setting or a security-scoped adapter, configure that instead of creating a symlink.
+After full verification, run `reveal` and normally ask the user to rename the original directory to `Name.internal-backup` in Finder. If the user explicitly asks Codex to do it, Codex must perform this reversible same-volume rename through the Finder UI, verify the exact source and backup paths before and after, and must not hand the rename back to the user or substitute Terminal `mv`. Renaming on the same internal filesystem does not duplicate its data. After Finder finishes, dry-run and execute `link`. If the app uses a native location setting or a security-scoped adapter, configure that instead of creating a symlink.
 
 A symlink consumes only a small amount of filesystem metadata; it is the only intentional internal write when original-path compatibility is required.
 
