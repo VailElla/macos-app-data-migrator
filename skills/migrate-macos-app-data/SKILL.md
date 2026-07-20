@@ -70,6 +70,8 @@ python3 scripts/migrate_app_data.py reveal \
 
 脚本只会在访达中定位内置 `.app`。用户确认外接程序实测正常后，亲自在访达中“移到废纸篓”；脚本不代删。`.app` 不建立原路径软链接。
 
+交接回复必须用文本提供一个直接指向内置 `.app` 的可点击本地文件链接，例如 `[在访达中选择内置 App.app](/Applications/App.app)`；不能只链接 `/Applications` 父目录或只让用户自己寻找。链接目标必须是本轮已核对的精确源路径。若当前客户端不能打开本地文件链接，再以 `reveal` 作为后备定位方式。链接只负责选择目标，仍由用户亲自在访达中移到废纸篓。
+
 为了在访达中区分副本，默认保留真实 `.app` 文件名，避免未经验证的改名影响更新器；在完整校验后给外接副本写入访达备注 `应用名（外接版）`。准确迁移路径仍按真实文件名记录。访达备注属于实例标识，不参与源与目标的负载元数据比较。
 
 ### 4B. 数据目录的访达交接
@@ -130,6 +132,8 @@ Run the `verify` command shown above. It re-hashes every regular file and compar
 ### 4A. Finder handoff for an `.app`
 
 Launch the verified app directly from the external volume. Test sign-in, existing-data reads, a safe write, full quit, relaunch, and updater behavior. Then run `reveal`; it only selects the internal `.app` in Finder. After the user confirms the external app works, the user moves the internal app to Trash in Finder. Do not create a source-path symlink for an app bundle.
+
+The handoff response must provide a clickable local-file link that targets the exact verified internal `.app`, for example `[Select the internal App.app in Finder](/Applications/App.app)`. Do not link only to the `/Applications` parent or make the user locate the bundle manually. Use `reveal` as a fallback when the client cannot open local-file links. The link selects the target; the user still moves it to Trash in Finder.
 
 Keep the real `.app` filename unless updater compatibility with renaming has been proven. After full verification, add the Finder comment `App Name (External)` to identify the external copy while preserving its exact path. This instance label is excluded from payload-metadata comparison.
 
