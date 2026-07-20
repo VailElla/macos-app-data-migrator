@@ -628,15 +628,16 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(refused.returncode, 2)
             self.assertIn("Metadata differs", refused.stderr)
 
-    def test_verification_ignores_system_managed_app_xattrs(self) -> None:
+    def test_verification_ignores_instance_local_app_xattrs(self) -> None:
         path = Path("/tmp/example.app")
+        finder_comment = b"com.apple.metadata:kMDItemFinderComment"
         macl = b"com.apple.macl"
         provenance = b"com.apple.provenance"
         application_metadata = b"com.example.application-metadata"
         with mock.patch.object(
             MIGRATOR_MODULE,
             "list_xattr_names",
-            return_value=[macl, provenance, application_metadata],
+            return_value=[finder_comment, macl, provenance, application_metadata],
         ), mock.patch.object(
             MIGRATOR_MODULE,
             "read_xattr",

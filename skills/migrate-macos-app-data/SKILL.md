@@ -15,6 +15,7 @@ description: Safely copy, verify, and hand off a macOS application bundle or one
 - 只有“完整校验通过 + 真实启用/读写/重启测试通过”才能声明迁移成功。无法证明兼容时保留源文件并停止。
 - 跨宗卷迁移不会增加内置盘中的用户数据占用，但 macOS 可能自行写入少量日志、权限记录或安全书签元数据；不要承诺操作系统层面的绝对零写入。
 - 分开记录迁移负载与程序运行时派生缓存。即使复制器和构建器不向内置盘写迁移负载，程序仍可能重新生成着色器、索引或其他缓存；实测增长超出用户可用空间时必须停止，不能宣称“运行时零增长”。
+- 真实界面测试前后都要记录内置盘可用空间，并检查 `~/Library/Group Containers/group.com.apple.coreservices.useractivityd/shared-pasteboard/archives`。不要把完整 `.app` 路径作为界面控制目标，也不要用剪贴板方式输入短测试文本；先按精确路径启动外接应用，再用 bundle ID 或显示名称控制界面。若共享剪贴板为外接文件生成大型内置归档，立即停止并报告准确文件与大小，不得自动清理。
 
 ### 1. 只读发现准确边界
 
@@ -69,6 +70,8 @@ python3 scripts/migrate_app_data.py reveal \
 
 脚本只会在访达中定位内置 `.app`。用户确认外接程序实测正常后，亲自在访达中“移到废纸篓”；脚本不代删。`.app` 不建立原路径软链接。
 
+为了在访达中区分副本，默认保留真实 `.app` 文件名，避免未经验证的改名影响更新器；在完整校验后给外接副本写入访达备注 `应用名（外接版）`。准确迁移路径仍按真实文件名记录。访达备注属于实例标识，不参与源与目标的负载元数据比较。
+
 ### 4B. 数据目录的访达交接
 
 完整校验后运行 `reveal`。让用户在访达中把原目录重命名为 `原名.internal-backup`；重命名不会复制数据，也不会额外占用等量内置空间。用户明确确认访达操作完成后，预演并建立一个很小的软链接：
@@ -104,6 +107,7 @@ python3 scripts/migrate_app_data.py link \
 - Declare success only after full verification and a real launch/read/write/relaunch smoke test. If compatibility cannot be proved, retain the source and stop.
 - Cross-volume migration adds no user payload to the internal disk. macOS may still create small OS-managed logs, permission records, or security-bookmark metadata, so do not promise literally zero operating-system writes.
 - Measure migration payload separately from runtime-derived app caches. Even when the copier and builder keep all migration payload external, the app may regenerate shaders, indexes, or other caches internally; stop if observed growth exceeds the user's available space, and never claim zero runtime growth.
+- Record internal free space before and after every real UI test, and inspect `~/Library/Group Containers/group.com.apple.coreservices.useractivityd/shared-pasteboard/archives`. Do not target UI automation by a full `.app` path or use clipboard-backed input for short test text. Launch the exact external path first, then control the UI by bundle ID or display name. If shared pasteboard creates a large internal archive for an external file, stop and report its exact path and size; never clean it automatically.
 
 ### 1. Discover one exact boundary read-only
 
@@ -126,6 +130,8 @@ Run the `verify` command shown above. It re-hashes every regular file and compar
 ### 4A. Finder handoff for an `.app`
 
 Launch the verified app directly from the external volume. Test sign-in, existing-data reads, a safe write, full quit, relaunch, and updater behavior. Then run `reveal`; it only selects the internal `.app` in Finder. After the user confirms the external app works, the user moves the internal app to Trash in Finder. Do not create a source-path symlink for an app bundle.
+
+Keep the real `.app` filename unless updater compatibility with renaming has been proven. After full verification, add the Finder comment `App Name (External)` to identify the external copy while preserving its exact path. This instance label is excluded from payload-metadata comparison.
 
 ### 4B. Finder handoff for a data directory
 

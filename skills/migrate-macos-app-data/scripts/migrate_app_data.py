@@ -1113,9 +1113,11 @@ def command_copy(arguments: argparse.Namespace) -> None:
 
 VERIFICATION_IGNORED_XATTRS = {
     # macOS can attach or rewrite these system-managed attributes when an app
-    # is copied to another volume and first launched. They are not source
-    # payload metadata and cannot remain byte-identical across app instances.
+    # is copied to another volume and first launched. Finder comments are an
+    # intentional instance label. None of these are source payload metadata
+    # that should remain byte-identical across app instances.
     b"com.apple.macl",
+    b"com.apple.metadata:kMDItemFinderComment",
     b"com.apple.provenance",
 }
 
