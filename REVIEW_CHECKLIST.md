@@ -77,7 +77,7 @@ git diff --check
 ```
 
 - [ ] 所有命令通过。 / Every command passes.
-- [ ] 测试完全在隔离目录中，不接触当前真实鸣潮迁移结果。 / Tests stay isolated and do not touch the current real Wuthering Waves migration.
+- [ ] 测试的目标副本、日志、partial、构建目录和缓存位于一次性外接 APFS RAM 宗卷；内置临时目录只有小型源夹具，且不接触当前真实鸣潮迁移结果。 / Test destinations, journals, partials, build directories, and caches stay on a disposable external APFS RAM volume; only small source fixtures are internal, and the current real Wuthering Waves migration is untouched.
 
 ## 9. 所有者决定 / Owner decision
 

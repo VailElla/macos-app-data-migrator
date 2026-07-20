@@ -37,7 +37,7 @@ Treat `Sandboxed: yes` as an unproven-symlink warning. Prefer the app's settings
 
 ## Filesystem and lifecycle requirements
 
-- Production migration accepts only a volume `diskutil` explicitly identifies as external APFS. Never use the internal-destination test override for real data.
+- Production migration accepts only a volume `diskutil` explicitly identifies as external APFS; the production CLI exposes no internal-volume override.
 - exFAT, NTFS, network filesystems, and cloud drives can lose ACLs, extended attributes, resource forks, hardlinks, permissions, or case semantics and are rejected by default.
 - Quit the app, launcher, updater, and helpers. The copier re-checks named processes periodically.
 - Require a stable external mount path. Stop immediately on disconnection; never continue into an internal directory that happens to have the same name.

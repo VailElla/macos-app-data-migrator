@@ -37,7 +37,7 @@ python3 scripts/inspect_app.py "/absolute/path/App.app" --verify-signature
 
 ## 文件系统与生命周期
 
-- 默认只接受能被 `diskutil` 明确识别为外接的 APFS 宗卷。不要在真实迁移中使用测试专用的内部宗卷绕过参数。
+- 只接受能被 `diskutil` 明确识别为外接的 APFS 宗卷；生产 CLI 不提供内部宗卷绕过参数。
 - exFAT、NTFS、网络文件系统和云盘可能丢失 ACL、扩展属性、resource fork、硬链接、权限或大小写语义，因此默认拒绝。
 - 完全退出程序、启动器、更新器和辅助进程；迁移过程中每隔数秒重新检查。
 - 外接盘应保持稳定挂载路径。断开时立即停止，不得在同名的内置目录中继续写入。

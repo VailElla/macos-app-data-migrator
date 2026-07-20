@@ -2,7 +2,7 @@
 
 ## Mandatory rules
 
-- The migration helper may run only `open -R` to select the exact path in Finder.
+- During the removal/rename handoff, the migration helper may run only `open -R` to select the exact path in Finder; it never substitutes a Terminal command for the user's Finder action.
 - The user personally renames or chooses Move to Trash in Finder.
 - Never request an administrator password, run `sudo`, or use `rm`, `mv`, `ditto --delete`, or any Terminal command to delete, overwrite, or replace an internal app/data path.
 - Path confirmation and deletion confirmation are separate gates. Ask for the latter only after full verification and app behavior tests pass.

@@ -85,7 +85,7 @@ xcrun swiftc -parse-as-library -typecheck \
   skills/migrate-macos-app-data/assets/wuthering-waves-launcher/main.swift
 ```
 
-测试在隔离临时目录中模拟 Finder 改名和目标文件损坏；生产迁移器本身不提供删除源文件的命令。
+测试使用一次性的外接 APFS RAM 宗卷承载目标副本、迁移日志、partial、构建目录和编译缓存；内置临时目录中只有很小的测试源夹具，并且不会接触当前真实迁移结果。测试覆盖真实 xattr/ACL 复制与篡改拒绝、软链接祖先路径拒绝、Finder 改名和目标文件损坏；生产迁移器本身不提供删除源文件的命令或内部宗卷绕过参数。
 
 ## English documentation
 
@@ -147,7 +147,7 @@ The builder requires an explicit external output. Its compiler cache and tempora
 
 ### Development validation
 
-Run the commands in the Chinese section. The test suite covers source immutability, dry-run behavior, copy resume, full hashing, metadata, hardlinks, symlinks, destination tampering, Finder handoff, launcher build/signing, app-copy signature verification, and the absence of source-deletion CLI commands.
+Run the commands in the Chinese section. The test suite puts destination copies, journals, partials, build directories, and compiler caches on a disposable external APFS RAM volume. Only small source fixtures live in the internal temporary directory, and no live migration is touched. The suite covers source immutability, dry-run behavior, copy resume, full hashing, real xattr/ACL preservation and tamper rejection, hardlinks, symlinks, canonical launcher paths, destination tampering, Finder handoff, launcher build/signing, app-copy signature verification, and the absence of source-deletion or internal-volume-override CLI commands.
 
 ## Repository layout / 仓库结构
 

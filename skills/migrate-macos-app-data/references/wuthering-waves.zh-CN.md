@@ -14,7 +14,7 @@
 ## 安全迁移顺序
 
 1. 完全退出鸣潮及 `Client-Mac-Shipping` 等辅助进程。
-2. 对准确的 `Resources` 执行 `audit`、`copy --execute` 和 `verify`。源 `Resources` 在完整校验前保持不变。
+2. 对准确的 `Resources` 先执行 `audit` 和不带 `--execute` 的 `copy` 预演；逐字符复核路径后执行相同的 `copy --execute`，最后运行 `verify`。源 `Resources` 在完整校验前保持不变。
 3. 如需迁移游戏 `.app`，作为独立组件用 `--kind app` 复制、验证签名，并从外接盘实测启动。
 4. 在外接 APFS 上预先建立启动器上级目录。
 5. 使用下面的构建器；所有 Swift 缓存、临时文件和生成物都位于 `--output-app` 所在的目标宗卷。

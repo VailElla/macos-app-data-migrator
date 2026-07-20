@@ -9,6 +9,8 @@ internal copy is deliberately handed back to the user in Finder.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -23,11 +25,50 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STATE_SUFFIX = ".migrate-macos-app-data.json"
 COPY_OVERHEAD_BYTES = 64 * 1024 * 1024
 PROCESS_CHECK_INTERVAL = 5.0
 CHUNK_SIZE = 8 * 1024 * 1024
+XATTR_NOFOLLOW = 0x0001
+ACL_TYPE_EXTENDED = 0x00000100
+
+
+# Apple's bundled Python does not expose Darwin xattr or ACL APIs through os.
+# Call libc directly so metadata handling stays dependency-free and fail-closed.
+LIBC = ctypes.CDLL(None, use_errno=True)
+LIBC.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+LIBC.listxattr.restype = ctypes.c_ssize_t
+LIBC.getxattr.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_uint32,
+    ctypes.c_int,
+]
+LIBC.getxattr.restype = ctypes.c_ssize_t
+LIBC.setxattr.argtypes = [
+    ctypes.c_char_p,
+    ctypes.c_char_p,
+    ctypes.c_void_p,
+    ctypes.c_size_t,
+    ctypes.c_uint32,
+    ctypes.c_int,
+]
+LIBC.setxattr.restype = ctypes.c_int
+LIBC.acl_get_file.argtypes = [ctypes.c_char_p, ctypes.c_int]
+LIBC.acl_get_file.restype = ctypes.c_void_p
+LIBC.acl_get_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int]
+LIBC.acl_get_link_np.restype = ctypes.c_void_p
+LIBC.acl_set_file.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+LIBC.acl_set_file.restype = ctypes.c_int
+LIBC.acl_set_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
+LIBC.acl_set_link_np.restype = ctypes.c_int
+LIBC.acl_to_text.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ssize_t)]
+LIBC.acl_to_text.restype = ctypes.c_void_p
+LIBC.acl_free.argtypes = [ctypes.c_void_p]
+LIBC.acl_free.restype = ctypes.c_int
 
 
 class MigrationError(RuntimeError):
@@ -412,33 +453,28 @@ class DestinationGuard:
             self.last_slow_check = now
 
 
-def require_destination_policy(
-    destination: Path,
-    allow_internal: bool,
-    allow_non_apfs: bool,
-) -> Dict[str, Any]:
+def require_destination_policy(destination: Path) -> Dict[str, Any]:
     parent = destination.parent
     if not parent.is_dir() or parent.is_symlink():
         raise MigrationError(
             "Destination parent must already exist and must not be a symlink / "
             f"目标上级目录必须已存在且不能是软链接: {parent}"
         )
-    if not allow_internal and parent.resolve(strict=True) != parent:
+    if parent.resolve(strict=True) != parent:
         raise MigrationError(
             f"Destination parent must use its canonical path / 目标上级目录必须使用真实路径而非别名: {parent}"
         )
     info = disk_info(parent)
-    if not allow_internal and info.get("internal") is not False:
+    if info.get("internal") is not False:
         raise MigrationError(
-            "Destination is not confirmed as an external volume / 未确认目标为外接宗卷; "
-            "the internal-volume override exists only for isolated tests"
+            "Destination is not confirmed as an external volume / 未确认目标为外接宗卷"
         )
     filesystem = str(info.get("filesystem") or "").lower()
-    if not allow_non_apfs and filesystem != "apfs":
+    if filesystem != "apfs":
         raise MigrationError(
             f"Destination filesystem is {filesystem or 'unknown'}, not APFS / 目标文件系统不是 APFS"
         )
-    if not allow_internal and not info.get("volume_uuid"):
+    if not info.get("volume_uuid"):
         raise MigrationError("External APFS volume UUID is unavailable / 无法读取外接 APFS 宗卷 UUID")
     return info
 
@@ -488,7 +524,6 @@ def make_initial_state(
     destination_info: Dict[str, Any],
     stats: Dict[str, Any],
     snapshot: Dict[str, Dict[str, Any]],
-    allow_internal_destination: bool,
 ) -> Dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -503,7 +538,6 @@ def make_initial_state(
         "destination_volume_uuid": destination_info.get("volume_uuid"),
         "destination_device": destination_info.get("device"),
         "destination_st_dev": destination_info.get("st_dev"),
-        "test_allow_internal_destination": allow_internal_destination,
         "initial_stats": stats,
         "source_snapshot": snapshot,
         "progress": {"files": 0, "symlinks": 0, "bytes": 0},
@@ -515,12 +549,11 @@ def make_initial_state(
 
 def require_journal_destination(destination: Path, state: Dict[str, Any]) -> Dict[str, Any]:
     current = disk_info(destination)
-    allow_internal = bool(state.get("test_allow_internal_destination", False))
-    if not allow_internal and current.get("internal") is not False:
+    if current.get("internal") is not False:
         raise MigrationError(
             "Verified external destination is no longer mounted / 已校验的外接目标当前未挂载"
         )
-    if not allow_internal and str(current.get("filesystem") or "").lower() != "apfs":
+    if str(current.get("filesystem") or "").lower() != "apfs":
         raise MigrationError("Destination is no longer external APFS / 目标已不是外接 APFS")
     expected_uuid = state.get("destination_volume_uuid")
     if expected_uuid:
@@ -544,51 +577,144 @@ def assert_snapshot_entry(relative: str, path: Path, expected: Dict[str, Any]) -
     return current
 
 
+def xattr_error(action: str, path: Path, name: Optional[bytes] = None) -> MigrationError:
+    error_number = ctypes.get_errno()
+    detail = os.strerror(error_number)
+    chinese_action = {"list": "列出", "read": "读取", "write": "写入"}.get(action, action)
+    attribute = ""
+    if name is not None:
+        attribute = f" {name.decode('utf-8', errors='backslashreplace')}"
+    return MigrationError(
+        f"Unable to {action} extended attribute / 无法{chinese_action}扩展属性"
+        f"{attribute}: {path}: [{error_number}] {detail}"
+    )
+
+
+def list_xattr_names(path: Path, follow_symlinks: bool) -> List[bytes]:
+    encoded_path = os.fsencode(path)
+    options = 0 if follow_symlinks else XATTR_NOFOLLOW
+    for _attempt in range(3):
+        ctypes.set_errno(0)
+        required = LIBC.listxattr(encoded_path, None, 0, options)
+        if required < 0:
+            raise xattr_error("list", path)
+        if required == 0:
+            return []
+        buffer = ctypes.create_string_buffer(required)
+        ctypes.set_errno(0)
+        actual = LIBC.listxattr(encoded_path, buffer, required, options)
+        if actual >= 0:
+            payload = buffer.raw[:actual]
+            if payload and not payload.endswith(b"\0"):
+                raise MigrationError(f"Malformed extended-attribute list / 扩展属性列表格式错误: {path}")
+            return sorted(name for name in payload.split(b"\0") if name)
+        if ctypes.get_errno() != errno.ERANGE:
+            raise xattr_error("list", path)
+    raise MigrationError(f"Extended attributes changed repeatedly / 扩展属性反复变化: {path}")
+
+
+def read_xattr(path: Path, name: bytes, follow_symlinks: bool) -> bytes:
+    encoded_path = os.fsencode(path)
+    options = 0 if follow_symlinks else XATTR_NOFOLLOW
+    for _attempt in range(3):
+        ctypes.set_errno(0)
+        required = LIBC.getxattr(encoded_path, name, None, 0, 0, options)
+        if required < 0:
+            raise xattr_error("read", path, name)
+        if required == 0:
+            return b""
+        buffer = ctypes.create_string_buffer(required)
+        ctypes.set_errno(0)
+        actual = LIBC.getxattr(encoded_path, name, buffer, required, 0, options)
+        if actual >= 0:
+            return buffer.raw[:actual]
+        if ctypes.get_errno() != errno.ERANGE:
+            raise xattr_error("read", path, name)
+    raise MigrationError(f"Extended attribute changed repeatedly / 扩展属性反复变化: {path}")
+
+
+def write_xattr(path: Path, name: bytes, value: bytes, follow_symlinks: bool) -> None:
+    encoded_path = os.fsencode(path)
+    options = 0 if follow_symlinks else XATTR_NOFOLLOW
+    buffer = ctypes.create_string_buffer(value, len(value)) if value else None
+    pointer = ctypes.cast(buffer, ctypes.c_void_p) if buffer is not None else None
+    ctypes.set_errno(0)
+    result = LIBC.setxattr(encoded_path, name, pointer, len(value), 0, options)
+    if result != 0:
+        raise xattr_error("write", path, name)
+
+
 def copy_xattrs(source: Path, destination: Path, follow_symlinks: bool) -> None:
+    for name in list_xattr_names(source, follow_symlinks):
+        value = read_xattr(source, name, follow_symlinks)
+        write_xattr(destination, name, value, follow_symlinks)
+
+
+def acl_error(action: str, path: Path) -> MigrationError:
+    error_number = ctypes.get_errno()
+    chinese_action = {"read": "读取", "serialize": "序列化", "write": "写入"}.get(action, action)
+    return MigrationError(
+        f"Unable to {action} ACL / 无法{chinese_action} ACL: {path}: "
+        f"[{error_number}] {os.strerror(error_number)}"
+    )
+
+
+def get_acl(path: Path, follow_symlinks: bool) -> Optional[int]:
+    ctypes.set_errno(0)
+    getter = LIBC.acl_get_file if follow_symlinks else LIBC.acl_get_link_np
+    acl = getter(os.fsencode(path), ACL_TYPE_EXTENDED)
+    if not acl:
+        error_number = ctypes.get_errno()
+        if error_number == errno.ENOENT and lexists(path):
+            return None
+        raise acl_error("read", path)
+    return acl
+
+
+def acl_text_from_pointer(acl: int, path: Path) -> str:
+    text_pointer: Optional[int] = None
     try:
-        source_names = os.listxattr(str(source), follow_symlinks=follow_symlinks)
-    except (AttributeError, OSError):
+        length = ctypes.c_ssize_t()
+        ctypes.set_errno(0)
+        text_pointer = LIBC.acl_to_text(acl, ctypes.byref(length))
+        if not text_pointer:
+            raise acl_error("serialize", path)
+        return ctypes.string_at(text_pointer, length.value).decode("utf-8")
+    finally:
+        if text_pointer:
+            LIBC.acl_free(text_pointer)
+
+
+def acl_text(path: Path) -> str:
+    acl = get_acl(path, follow_symlinks=not path.is_symlink())
+    if acl is None:
+        return ""
+    try:
+        return acl_text_from_pointer(acl, path)
+    finally:
+        LIBC.acl_free(acl)
+
+
+def copy_acl(source: Path, destination: Path, follow_symlinks: bool) -> None:
+    acl = get_acl(source, follow_symlinks)
+    if acl is None:
         return
-    for name in source_names:
-        try:
-            value = os.getxattr(str(source), name, follow_symlinks=follow_symlinks)
-            os.setxattr(str(destination), name, value, follow_symlinks=follow_symlinks)
-        except OSError as error:
-            raise MigrationError(f"Unable to preserve extended attribute {name}: {error}") from error
-
-
-def acl_entries(path: Path) -> List[str]:
     try:
-        result = subprocess.run(
-            ["/bin/ls", "-lde", str(path)],
-            check=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return []
-    lines = result.stdout.splitlines()[1:]
-    return [line.strip() for line in lines if line.strip()]
+        if not acl_text_from_pointer(acl, source):
+            return
+        ctypes.set_errno(0)
+        setter = LIBC.acl_set_file if follow_symlinks else LIBC.acl_set_link_np
+        result = setter(os.fsencode(destination), ACL_TYPE_EXTENDED, acl)
+        if result != 0:
+            raise acl_error("write", destination)
+    finally:
+        LIBC.acl_free(acl)
 
 
 def copy_directory_metadata(source: Path, destination: Path) -> None:
     shutil.copystat(str(source), str(destination), follow_symlinks=False)
     copy_xattrs(source, destination, follow_symlinks=False)
-    entries = acl_entries(source)
-    if entries:
-        acl_text = "\n".join(entries) + "\n"
-        try:
-            subprocess.run(
-                ["/bin/chmod", "-E", str(destination)],
-                input=acl_text,
-                text=True,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except (OSError, subprocess.CalledProcessError) as error:
-            raise MigrationError(f"Unable to preserve directory ACL / 无法保留目录 ACL: {source}: {error}") from error
+    copy_acl(source, destination, follow_symlinks=True)
 
 
 def copy_symlink_metadata(source: Path, destination: Path) -> None:
@@ -597,6 +723,7 @@ def copy_symlink_metadata(source: Path, destination: Path) -> None:
         shutil.copystat(str(source), str(destination), follow_symlinks=False)
     except (NotImplementedError, OSError):
         pass
+    copy_acl(source, destination, follow_symlinks=False)
 
 
 def partial_path(destination_file: Path, migration_id: str) -> Path:
@@ -869,11 +996,7 @@ def command_copy(arguments: argparse.Namespace) -> None:
     validate_source_and_destination(source, destination)
     require_source_directory(source)
     kind = resolve_kind(source, arguments.kind)
-    destination_info = require_destination_policy(
-        destination,
-        arguments.test_allow_internal_destination,
-        False,
-    )
+    destination_info = require_destination_policy(destination)
     require_processes_stopped(arguments.process_name)
 
     stats = tree_stats(source)
@@ -903,7 +1026,6 @@ def command_copy(arguments: argparse.Namespace) -> None:
             destination_info,
             stats,
             snapshot,
-            arguments.test_allow_internal_destination,
         )
 
     existing_payload = 0
@@ -939,16 +1061,9 @@ def command_copy(arguments: argparse.Namespace) -> None:
 
 def xattr_map(path: Path, follow_symlinks: bool) -> Dict[str, str]:
     result: Dict[str, str] = {}
-    try:
-        names = os.listxattr(str(path), follow_symlinks=follow_symlinks)
-    except (AttributeError, OSError):
-        return result
-    for name in sorted(names):
-        try:
-            value = os.getxattr(str(path), name, follow_symlinks=follow_symlinks)
-        except OSError as error:
-            raise MigrationError(f"Cannot read extended attribute {name}: {path}: {error}") from error
-        result[name] = hashlib.sha256(value).hexdigest()
+    for name in list_xattr_names(path, follow_symlinks):
+        value = read_xattr(path, name, follow_symlinks)
+        result[name.hex()] = hashlib.sha256(value).hexdigest()
     return result
 
 
@@ -959,7 +1074,7 @@ def verification_record(path: Path, metadata: os.stat_result) -> Dict[str, Any]:
         "mode": stat.S_IMODE(metadata.st_mode),
         "flags": getattr(metadata, "st_flags", 0),
         "xattrs": xattr_map(path, follow_symlinks=False),
-        "acl": acl_entries(path),
+        "acl": acl_text(path),
     }
     if kind != "symlink":
         record["mtime_ns"] = metadata.st_mtime_ns
@@ -1165,7 +1280,6 @@ def build_parser() -> argparse.ArgumentParser:
     copy.add_argument("--destination", required=True)
     copy.add_argument("--kind", choices=("auto", "app", "data"), default="auto")
     copy.add_argument("--process-name", action="append", default=[])
-    copy.add_argument("--test-allow-internal-destination", action="store_true", help=argparse.SUPPRESS)
     copy.add_argument("--execute", action="store_true")
     copy.set_defaults(handler=command_copy)
 

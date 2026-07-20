@@ -4,10 +4,13 @@ import hashlib
 import json
 import os
 import plistlib
+import re
+import shutil
 import stat
 import subprocess
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from typing import Any, Dict
 
@@ -16,6 +19,61 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = REPO_ROOT / "skills" / "migrate-macos-app-data"
 MIGRATOR = SKILL_ROOT / "scripts" / "migrate_app_data.py"
 LAUNCHER_BUILDER = SKILL_ROOT / "scripts" / "build_wuthering_waves_launcher.sh"
+
+
+class ExternalAPFSTestVolume:
+    """A disposable external APFS RAM volume with no internal-disk payload."""
+
+    def __init__(self) -> None:
+        self.device: str | None = None
+        self.mount_path: Path | None = None
+
+    def create(self) -> Path:
+        attach = subprocess.run(
+            ["/usr/bin/hdiutil", "attach", "-nomount", "ram://1048576"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        match = re.search(r"/dev/disk\d+", attach.stdout)
+        if match is None:
+            raise AssertionError(f"RAM disk device not found: {attach.stdout!r}")
+        self.device = match.group(0)
+        volume_name = f"MigratorTests-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        subprocess.run(
+            ["/usr/sbin/diskutil", "eraseVolume", "APFS", volume_name, self.device],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        info = subprocess.run(
+            ["/usr/sbin/diskutil", "info", "-plist", volume_name],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        payload = plistlib.loads(info.stdout)
+        if payload.get("Internal") is not False or payload.get("FilesystemType") != "apfs":
+            raise AssertionError(f"Unexpected RAM volume policy: {payload}")
+        self.mount_path = Path(payload["MountPoint"])
+        return self.mount_path
+
+    def close(self) -> None:
+        if self.device is None:
+            return
+        device = self.device
+        result = subprocess.run(
+            ["/usr/bin/hdiutil", "detach", self.device],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            raise AssertionError(f"Unable to detach test RAM volume {device}: {result.stderr}")
+        self.device = None
+        self.mount_path = None
 
 
 def run_migrator(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -88,18 +146,81 @@ def copy_arguments(source: Path, destination: Path) -> list[str]:
         str(source),
         "--destination",
         str(destination),
-        "--test-allow-internal-destination",
     ]
 
 
+def write_xattr(path: Path, name: str, value: bytes, symlink: bool = False) -> None:
+    command = ["/usr/bin/xattr"]
+    if symlink:
+        command.append("-s")
+    command.extend(["-w", "-x", name, value.hex(), str(path)])
+    subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def read_xattr(path: Path, name: str, symlink: bool = False) -> bytes:
+    command = ["/usr/bin/xattr"]
+    if symlink:
+        command.append("-s")
+    command.extend(["-p", "-x", name, str(path)])
+    result = subprocess.run(
+        command,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return bytes.fromhex("".join(result.stdout.split()))
+
+
+def add_acl(path: Path, entry: str) -> None:
+    command = ["/bin/chmod", "+a", entry, str(path)]
+    subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def acl_entries_for_test(path: Path) -> list[str]:
+    result = subprocess.run(
+        ["/bin/ls", "-lde", str(path)],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    entries: list[str] = []
+    for line in result.stdout.splitlines()[1:]:
+        match = re.match(r"^\s*\d+:\s*(.+)$", line)
+        if match:
+            entries.append(match.group(1))
+    return entries
+
+
 class MigrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.test_volume = ExternalAPFSTestVolume()
+        cls.addClassCleanup(cls.test_volume.close)
+        cls.external_root = cls.test_volume.create()
+
+    def external_parent(self, label: str) -> Path:
+        path = self.external_root / f"{label}-{uuid.uuid4().hex}"
+        path.mkdir()
+        return path
+
     def test_copy_verify_resume_and_links_preserve_source_exactly(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-copy-") as temporary:
             root = Path(temporary)
             source = root / "internal" / "Example Data"
-            destination = root / "external" / "Example Data"
+            destination = self.external_parent("copy") / "Example Data"
             source.mkdir(parents=True)
-            destination.parent.mkdir(parents=True)
 
             first_data = b"first-file\n" * 128
             second_data = hashlib.sha256(b"deterministic").digest() * 4096
@@ -118,7 +239,7 @@ class MigrationTests(unittest.TestCase):
 
             state_path = destination.parent / f".{destination.name}.migrate-macos-app-data.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(state["schema_version"], 2)
+            self.assertEqual(state["schema_version"], 3)
             self.assertEqual(state["status"], "copied")
             self.assertFalse(state["source_deleted_by_tool"])
 
@@ -152,9 +273,8 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="migrate-app-finder-") as temporary:
             root = Path(temporary)
             source = root / "internal" / "App Data"
-            destination = root / "external" / "App Data"
+            destination = self.external_parent("finder") / "App Data"
             write_file(source / "content.bin", b"safe content")
-            destination.parent.mkdir(parents=True)
 
             run_migrator(*copy_arguments(source, destination), "--execute")
             run_migrator("verify", "--source", str(source), "--destination", str(destination))
@@ -209,9 +329,8 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="migrate-app-dry-") as temporary:
             root = Path(temporary)
             source = root / "internal" / "Data"
-            destination = root / "external" / "Data"
+            destination = self.external_parent("dry-run") / "Data"
             write_file(source / "hello.txt", b"hello")
-            destination.parent.mkdir(parents=True)
             before = source_snapshot(source)
 
             result = run_migrator(*copy_arguments(source, destination))
@@ -222,11 +341,11 @@ class MigrationTests(unittest.TestCase):
                 (destination.parent / f".{destination.name}.migrate-macos-app-data.json").exists()
             )
 
-    def test_internal_destination_requires_hidden_test_override(self) -> None:
+    def test_internal_destination_is_refused(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-volume-") as temporary:
             root = Path(temporary)
             source = root / "internal" / "Data"
-            destination = root / "external" / "Data"
+            destination = root / "internal-destination" / "Data"
             write_file(source / "hello.txt", b"hello")
             destination.parent.mkdir(parents=True)
             result = run_migrator(
@@ -235,6 +354,32 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertRegex(result.stderr, r"not confirmed as an external volume|canonical path")
             self.assertFalse(destination.exists())
+
+    def test_destination_symlink_ancestor_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-symlink-parent-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            write_file(source / "hello.txt", b"hello")
+            real_parent = self.external_parent("real-parent")
+            (real_parent / "Nested").mkdir()
+            alias_parent = self.external_root / f"alias-{uuid.uuid4().hex}"
+            alias_parent.symlink_to(real_parent, target_is_directory=True)
+            destination = alias_parent / "Nested" / "Data"
+
+            result = run_migrator(
+                "copy",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("canonical path", result.stderr)
+            self.assertFalse(destination.exists())
+            self.assertFalse(
+                (destination.parent / f".{destination.name}.migrate-macos-app-data.json").exists()
+            )
 
     def test_broad_source_path_is_refused(self) -> None:
         unsafe_sources = (
@@ -260,9 +405,8 @@ class MigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="migrate-app-tamper-") as temporary:
             root = Path(temporary)
             source = root / "internal" / "Data"
-            destination = root / "external" / "Data"
+            destination = self.external_parent("tamper") / "Data"
             write_file(source / "hello.txt", b"original")
-            destination.parent.mkdir(parents=True)
             before = source_snapshot(source)
             run_migrator(*copy_arguments(source, destination), "--execute")
             (destination / "hello.txt").write_bytes(b"tampered")
@@ -273,28 +417,143 @@ class MigrationTests(unittest.TestCase):
             self.assertRegex(result.stderr, r"SHA-256 mismatch|Metadata differs")
             self.assertEqual(source_snapshot(source), before)
 
+    def test_xattrs_are_copied_and_tampering_blocks_verification(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-xattr-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = self.external_parent("xattr") / "Data"
+            write_file(source / "payload.bin", b"xattr payload")
+            os.symlink("payload.bin", source / "payload-link")
+            directory_value = b"directory metadata\x00with binary"
+            file_value = b"file metadata\xff"
+            symlink_value = b"symlink metadata"
+            write_xattr(source, "com.example.migrator-directory", directory_value)
+            write_xattr(source / "payload.bin", "com.example.migrator-file", file_value)
+            write_xattr(
+                source / "payload-link",
+                "com.example.migrator-symlink",
+                symlink_value,
+                symlink=True,
+            )
+
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            verified = run_migrator(
+                "verify", "--source", str(source), "--destination", str(destination)
+            )
+            self.assertIn("Full verification passed", verified.stdout)
+            self.assertEqual(
+                read_xattr(destination, "com.example.migrator-directory"),
+                directory_value,
+            )
+            self.assertEqual(
+                read_xattr(destination / "payload.bin", "com.example.migrator-file"),
+                file_value,
+            )
+            self.assertEqual(
+                read_xattr(
+                    destination / "payload-link",
+                    "com.example.migrator-symlink",
+                    symlink=True,
+                ),
+                symlink_value,
+            )
+
+            write_xattr(
+                destination / "payload.bin",
+                "com.example.migrator-file",
+                b"tampered metadata",
+            )
+            refused = run_migrator(
+                "verify",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                check=False,
+            )
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("Metadata differs", refused.stderr)
+
+    def test_acls_are_copied_and_tampering_blocks_verification(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-acl-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = self.external_parent("acl") / "Data"
+            write_file(source / "payload.bin", b"acl payload")
+            os.symlink("payload.bin", source / "payload-link")
+            acl_entry = "everyone allow readattr"
+            add_acl(source, acl_entry)
+            add_acl(source / "payload.bin", acl_entry)
+
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            verified = run_migrator(
+                "verify", "--source", str(source), "--destination", str(destination)
+            )
+            self.assertIn("Full verification passed", verified.stdout)
+            self.assertEqual(acl_entries_for_test(destination), acl_entries_for_test(source))
+            self.assertEqual(
+                acl_entries_for_test(destination / "payload.bin"),
+                acl_entries_for_test(source / "payload.bin"),
+            )
+            subprocess.run(
+                ["/bin/chmod", "-N", str(destination)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            refused = run_migrator(
+                "verify",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                check=False,
+            )
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("Metadata differs", refused.stderr)
+
     def test_launcher_and_app_copy_are_built_and_verified(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-launcher-test-") as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             game = root / "Fake Game.app"
-            resources = root / "external" / "Resources"
-            output_parent = root / "external" / "Applications"
+            resources_parent = self.external_parent("launcher-resources")
+            resources = resources_parent / "Resources"
+            output_parent = self.external_parent("launcher-output")
             output = output_parent / "Test External Launcher.app"
-            copied_parent = root / "second-external" / "Applications"
+            copied_parent = self.external_parent("launcher-copy")
             copied_app = copied_parent / output.name
-            (game / "Contents").mkdir(parents=True)
+            (game / "Contents" / "MacOS").mkdir(parents=True)
             resources.mkdir(parents=True)
-            output_parent.mkdir(parents=True)
-            copied_parent.mkdir(parents=True)
+            fake_executable = game / "Contents" / "MacOS" / "FakeGame"
+            shutil.copyfile("/usr/bin/true", fake_executable)
+            fake_executable.chmod(0o755)
             with (game / "Contents" / "Info.plist").open("wb") as handle:
                 plistlib.dump(
                     {
                         "CFBundleIdentifier": "test.fake.game",
                         "CFBundleExecutable": "FakeGame",
                         "CFBundleName": "Fake Game",
+                        "CFBundlePackageType": "APPL",
                     },
                     handle,
                 )
+            signed = subprocess.run(
+                [
+                    "/usr/bin/codesign",
+                    "--force",
+                    "--deep",
+                    "--sign",
+                    "-",
+                    "--identifier",
+                    "test.fake.game",
+                    str(game),
+                ],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(signed.returncode, 0, msg=signed.stderr)
 
             build_command = [
                 str(LAUNCHER_BUILDER),
@@ -312,8 +571,27 @@ class MigrationTests(unittest.TestCase):
                 "Test External Launcher",
                 "--warning-delay",
                 "15",
-                "--test-allow-internal-output",
             ]
+
+            nested_resources = resources / "Nested"
+            nested_resources.mkdir()
+            resources_alias = resources_parent / "ResourcesAlias"
+            resources_alias.symlink_to(resources, target_is_directory=True)
+            escaped_output = resources_alias / "Nested" / "Escaped Launcher.app"
+            escaped_command = list(build_command)
+            output_index = escaped_command.index("--output-app") + 1
+            escaped_command[output_index] = str(escaped_output)
+            escaped = subprocess.run(
+                escaped_command,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(escaped.returncode, 2)
+            self.assertIn("canonical", escaped.stderr)
+            self.assertFalse((nested_resources / escaped_output.name).exists())
+
             result = subprocess.run(
                 build_command,
                 check=False,
@@ -349,7 +627,6 @@ class MigrationTests(unittest.TestCase):
                 str(copied_app),
                 "--kind",
                 "app",
-                "--test-allow-internal-destination",
                 "--execute",
             )
             verified = run_migrator(

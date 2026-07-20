@@ -14,7 +14,6 @@ bundle_id="local.migrate-macos-app-data.wuthering-waves-launcher"
 game_bundle_id="com.kurogame.mingchao"
 display_name="鸣潮（外接数据）"
 warning_delay="65"
-allow_internal_output="false"
 build_root=""
 
 usage() {
@@ -65,10 +64,6 @@ while (( $# > 0 )); do
       warning_delay="${2:?missing value for --warning-delay}"
       shift 2
       ;;
-    --test-allow-internal-output)
-      allow_internal_output="true"
-      shift
-      ;;
     -h|--help)
       usage
       exit 0
@@ -83,6 +78,10 @@ done
 
 if [[ -z "$game_app" || -z "$resources" || -z "$output_app" ]]; then
   usage >&2
+  exit 2
+fi
+if [[ "$game_app" != /* || "$resources" != /* ]]; then
+  print -u2 -- "游戏和 Resources 必须使用绝对路径 / Game and Resources must use absolute paths"
   exit 2
 fi
 if [[ ! -d "$game_app" || -L "$game_app" || "$game_app" != *.app ]]; then
@@ -121,7 +120,30 @@ if [[ -e "$output_app" || -L "$output_app" ]]; then
   print -u2 -- "拒绝覆盖已有输出；如需移除请在访达中手动处理 / Refusing to replace existing output; manage it manually in Finder: $output_app"
   exit 2
 fi
-if [[ "$output_app" == "$game_app" || "$output_app" == "$game_app"/* || "$output_app" == "$resources" || "$output_app" == "$resources"/* ]]; then
+
+output_parent="${output_app:h}"
+if [[ ! -d "$output_parent" || -L "$output_parent" ]]; then
+  print -u2 -- "输出上级目录必须已存在且不能是软链接 / Output parent must already exist and not be a symlink: $output_parent"
+  exit 2
+fi
+
+game_app_real="${game_app:A}"
+resources_real="${resources:A}"
+output_parent_real="${output_parent:A}"
+output_app_real="$output_parent_real/${output_app:t}"
+if [[ "$game_app" != "$game_app_real" ]]; then
+  print -u2 -- "游戏路径必须是无软链接祖先的真实路径 / Game path must be canonical and contain no symlink ancestor: $game_app"
+  exit 2
+fi
+if [[ "$resources" != "$resources_real" ]]; then
+  print -u2 -- "Resources 路径必须是无软链接祖先的真实路径 / Resources path must be canonical and contain no symlink ancestor: $resources"
+  exit 2
+fi
+if [[ "$output_parent" != "$output_parent_real" ]]; then
+  print -u2 -- "输出上级目录必须是无软链接祖先的真实路径 / Output parent must be canonical and contain no symlink ancestor: $output_parent"
+  exit 2
+fi
+if [[ "$output_app_real" == "$game_app_real" || "$output_app_real" == "$game_app_real"/* || "$output_app_real" == "$resources_real" || "$output_app_real" == "$resources_real"/* ]]; then
   print -u2 -- "输出不能位于游戏或资源源目录内部 / Output must not be inside the game or source Resources"
   exit 2
 fi
@@ -129,12 +151,6 @@ fi
 actual_game_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$game_app/Contents/Info.plist" 2>/dev/null || true)"
 if [[ "$actual_game_bundle_id" != "$game_bundle_id" ]]; then
   print -u2 -- "游戏 Bundle ID 不匹配 / Game bundle ID mismatch: expected $game_bundle_id, found ${actual_game_bundle_id:-unknown}"
-  exit 2
-fi
-
-output_parent="${output_app:h}"
-if [[ ! -d "$output_parent" || -L "$output_parent" ]]; then
-  print -u2 -- "输出上级目录必须已存在且不能是软链接 / Output parent must already exist and not be a symlink: $output_parent"
   exit 2
 fi
 
@@ -148,11 +164,11 @@ if [[ -x /usr/sbin/diskutil ]]; then
     volume_filesystem="$(print -rn -- "$volume_plist" | /usr/bin/plutil -extract FilesystemType raw -o - - 2>/dev/null || true)"
   fi
 fi
-if [[ "$allow_internal_output" != "true" && "$volume_internal" != "false" ]]; then
+if [[ "$volume_internal" != "false" ]]; then
   print -u2 -- "未确认输出位于外接宗卷 / Output is not confirmed on an external volume: $output_parent"
   exit 2
 fi
-if [[ "$allow_internal_output" != "true" && "$volume_filesystem" != "apfs" ]]; then
+if [[ "$volume_filesystem" != "apfs" ]]; then
   print -u2 -- "外接输出宗卷必须是 APFS / External output volume must be APFS: ${volume_filesystem:-unknown}"
   exit 2
 fi
@@ -167,17 +183,15 @@ if [[ -x /usr/sbin/diskutil ]]; then
     resources_filesystem="$(print -rn -- "$resources_plist" | /usr/bin/plutil -extract FilesystemType raw -o - - 2>/dev/null || true)"
   fi
 fi
-if [[ "$allow_internal_output" != "true" && "$resources_internal" != "false" ]]; then
+if [[ "$resources_internal" != "false" ]]; then
   print -u2 -- "未确认 Resources 位于外接宗卷 / Resources is not confirmed on an external volume: $resources"
   exit 2
 fi
-if [[ "$allow_internal_output" != "true" && "$resources_filesystem" != "apfs" ]]; then
+if [[ "$resources_filesystem" != "apfs" ]]; then
   print -u2 -- "Resources 宗卷必须是 APFS / Resources volume must be APFS: ${resources_filesystem:-unknown}"
   exit 2
 fi
-if [[ "$allow_internal_output" != "true" ]]; then
-  /usr/bin/codesign --verify --deep --strict "$game_app"
-fi
+/usr/bin/codesign --verify --deep --strict "$game_app"
 
 cleanup_external_build() {
   # Only remove this invocation's generated build root on the already-verified

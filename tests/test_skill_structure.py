@@ -69,6 +69,8 @@ class SkillStructureTests(unittest.TestCase):
         self.assertNotIn("$HOME", builder)
         self.assertNotIn("${TMPDIR", builder)
         self.assertNotIn("--replace", builder)
+        self.assertNotIn("--test-allow", builder)
+        self.assertNotIn("--test-allow", migrator)
         self.assertIn('build_root="$(/usr/bin/mktemp -d "$output_parent/', builder)
 
     def test_public_repository_materials_exist(self) -> None:
