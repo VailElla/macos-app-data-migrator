@@ -1,0 +1,4 @@
+interface:
+  display_name: "macOS 应用数据迁移"
+  short_description: "以低额外空间安全迁移 macOS 应用数据到内置或外接磁盘"
+  default_prompt: "Use $migrate-macos-app-data to safely move one macOS app data directory to another volume with minimal temporary disk usage."

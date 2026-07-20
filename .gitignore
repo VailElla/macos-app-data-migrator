@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.app/
+dist/
+build/
+*.partial
+.*.migrate-macos-app-data.json

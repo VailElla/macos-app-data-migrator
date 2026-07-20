@@ -1,0 +1,28 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Python and shell syntax
+        run: |
+          python3 -m py_compile \
+            skills/migrate-macos-app-data/scripts/migrate_app_data.py \
+            skills/migrate-macos-app-data/scripts/inspect_app.py
+          zsh -n skills/migrate-macos-app-data/scripts/build_wuthering_waves_launcher.sh
+      - name: Run isolated tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Type-check launcher source
+        run: |
+          xcrun swiftc -parse-as-library -typecheck \
+            -framework AppKit \
+            -framework ApplicationServices \
+            skills/migrate-macos-app-data/assets/wuthering-waves-launcher/main.swift
