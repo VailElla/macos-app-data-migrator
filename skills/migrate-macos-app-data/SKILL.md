@@ -15,7 +15,7 @@ description: Safely copy, verify, and hand off a macOS application bundle or one
 - 只有“完整校验通过 + 真实启用/读写/重启测试通过”才能声明迁移成功。无法证明兼容时保留源文件并停止。
 - 跨宗卷迁移不会增加内置盘中的用户数据占用，但 macOS 可能自行写入少量日志、权限记录或安全书签元数据；不要承诺操作系统层面的绝对零写入。
 - 分开记录迁移负载与程序运行时派生缓存。即使复制器和构建器不向内置盘写迁移负载，程序仍可能重新生成着色器、索引或其他缓存；实测增长超出用户可用空间时必须停止，不能宣称“运行时零增长”。
-- 真实界面测试前后都要记录内置盘可用空间，并检查 `~/Library/Group Containers/group.com.apple.coreservices.useractivityd/shared-pasteboard/archives`。不要把完整 `.app` 路径作为界面控制目标，也不要用剪贴板方式输入短测试文本；先按精确路径启动外接应用，再用 bundle ID 或显示名称控制界面。若共享剪贴板为外接文件生成大型内置归档，立即停止并报告准确文件与大小，不得自动清理。
+- 真实界面测试前后都要记录内置盘可用空间，并检查 `~/Library/Group Containers/group.com.apple.coreservices.useractivityd/shared-pasteboard/archives`。测试前记录现有条目的路径、inode、大小与时间，作为不可触碰的基线。不要把完整 `.app` 路径作为界面控制目标，也不要用剪贴板方式输入短测试文本；先按精确路径启动外接应用，再用 bundle ID 或显示名称控制界面。测试后只处理本轮新生成、且能由测试时间窗口和迁移对象大小证明归属的归档：先用 `lsof` 确认未被占用，再自动通过访达移到系统废纸篓。不得处理基线条目、强制结束 `useractivityd`、永久删除或自动清倒废纸篓；新归档仍被占用或归属不明确时必须停止并报告。
 
 ### 1. 只读发现准确边界
 
@@ -107,7 +107,7 @@ python3 scripts/migrate_app_data.py link \
 - Declare success only after full verification and a real launch/read/write/relaunch smoke test. If compatibility cannot be proved, retain the source and stop.
 - Cross-volume migration adds no user payload to the internal disk. macOS may still create small OS-managed logs, permission records, or security-bookmark metadata, so do not promise literally zero operating-system writes.
 - Measure migration payload separately from runtime-derived app caches. Even when the copier and builder keep all migration payload external, the app may regenerate shaders, indexes, or other caches internally; stop if observed growth exceeds the user's available space, and never claim zero runtime growth.
-- Record internal free space before and after every real UI test, and inspect `~/Library/Group Containers/group.com.apple.coreservices.useractivityd/shared-pasteboard/archives`. Do not target UI automation by a full `.app` path or use clipboard-backed input for short test text. Launch the exact external path first, then control the UI by bundle ID or display name. If shared pasteboard creates a large internal archive for an external file, stop and report its exact path and size; never clean it automatically.
+- Record internal free space before and after every real UI test, and inspect `~/Library/Group Containers/group.com.apple.coreservices.useractivityd/shared-pasteboard/archives`. Before testing, snapshot every existing entry's path, inode, size, and timestamp as an untouchable baseline. Do not target UI automation by a full `.app` path or use clipboard-backed input for short test text. Launch the exact external path first, then control the UI by bundle ID or display name. After testing, handle only archives created during the current run whose ownership is proven by the test window and migrated-object size: confirm with `lsof` that each file is unused, then move it to system Trash through Finder automatically. Never touch baseline entries, terminate `useractivityd`, permanently delete files, or empty Trash automatically. Stop and report any new archive that remains open or cannot be attributed safely.
 
 ### 1. Discover one exact boundary read-only
 
