@@ -1125,11 +1125,36 @@ APP_ROOT_INSTANCE_LOCAL_XATTRS = frozenset(
     }
 )
 
+# macOS may attach this protected, system-generated attribute to every entry
+# created while copying an application bundle to another volume. It cannot be
+# removed reliably by an unprivileged process. Verification may therefore
+# accept it only when it is an extra destination attribute in an app bundle.
+# A source value must still be preserved exactly, and data migrations retain
+# strict bidirectional xattr comparison.
+APP_DESTINATION_ONLY_XATTRS = frozenset({b"com.apple.provenance"})
+
 
 def verification_ignored_xattrs(kind: str, relative: str) -> frozenset[bytes]:
     if kind == "app" and relative == ".":
         return APP_ROOT_INSTANCE_LOCAL_XATTRS
     return frozenset()
+
+
+def normalize_destination_only_app_xattrs(
+    source_record: Dict[str, Any],
+    destination_record: Dict[str, Any],
+    kind: str,
+) -> None:
+    if kind != "app":
+        return
+    source_xattrs = source_record.get("xattrs")
+    destination_xattrs = destination_record.get("xattrs")
+    if not isinstance(source_xattrs, dict) or not isinstance(destination_xattrs, dict):
+        return
+    for name in APP_DESTINATION_ONLY_XATTRS:
+        key = name.hex()
+        if key not in source_xattrs:
+            destination_xattrs.pop(key, None)
 
 
 def xattr_map(
@@ -1286,6 +1311,9 @@ def full_verify(source: Path, destination: Path, kind: str = "data") -> Dict[str
         destination_record = dict(destination_before[relative])
         source_expected = source_record.pop("_stability_stat")
         destination_expected = destination_record.pop("_stability_stat")
+        source_record["xattrs"] = dict(source_record["xattrs"])
+        destination_record["xattrs"] = dict(destination_record["xattrs"])
+        normalize_destination_only_app_xattrs(source_record, destination_record, kind)
         if source_record != destination_record:
             raise MigrationError(f"Metadata differs / 元数据不一致: {relative}")
         if source_record["type"] == "file":

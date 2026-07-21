@@ -727,6 +727,53 @@ class MigrationTests(unittest.TestCase):
             with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Metadata differs"):
                 MIGRATOR_MODULE.full_verify(source, destination, kind="app")
 
+    def test_normalize_allows_only_extra_destination_app_provenance(self) -> None:
+        provenance_key = b"com.apple.provenance".hex()
+
+        source_record = {"xattrs": {}}
+        destination_snapshot = {
+            "xattrs": {provenance_key: "destination-system-instance"}
+        }
+        destination_record = dict(destination_snapshot)
+        destination_record["xattrs"] = dict(destination_record["xattrs"])
+        MIGRATOR_MODULE.normalize_destination_only_app_xattrs(
+            source_record,
+            destination_record,
+            "app",
+        )
+        self.assertEqual(destination_record["xattrs"], {})
+        self.assertEqual(
+            destination_snapshot["xattrs"],
+            {provenance_key: "destination-system-instance"},
+        )
+
+        destination_data_record = {
+            "xattrs": {provenance_key: "destination-system-instance"}
+        }
+        MIGRATOR_MODULE.normalize_destination_only_app_xattrs(
+            source_record,
+            destination_data_record,
+            "data",
+        )
+        self.assertEqual(
+            destination_data_record["xattrs"],
+            {provenance_key: "destination-system-instance"},
+        )
+
+        source_with_provenance = {"xattrs": {provenance_key: "source-value"}}
+        destination_with_changed_provenance = {
+            "xattrs": {provenance_key: "destination-value"}
+        }
+        MIGRATOR_MODULE.normalize_destination_only_app_xattrs(
+            source_with_provenance,
+            destination_with_changed_provenance,
+            "app",
+        )
+        self.assertNotEqual(
+            source_with_provenance["xattrs"],
+            destination_with_changed_provenance["xattrs"],
+        )
+
     def test_acls_are_copied_and_tampering_blocks_verification(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-acl-") as temporary:
             root = Path(temporary)
