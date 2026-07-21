@@ -20,8 +20,8 @@
 
 1. After full verification, run `reveal` to select the original directory in Finder.
 2. After explicit authorization, Codex moves the source to Trash through Finder without emptying Trash and never substitutes a Terminal command. Use `Name.internal-backup` only when the user explicitly prefers a sibling backup.
-3. Confirm that the original path is free and the trashed source still supports Put Back (or that the sibling backup remains), then dry-run `link`.
-4. Execute `link --execute` only after the user reviews both exact paths. It creates only a symlink.
+3. Confirm that the original path is free and record the exact recovery path in Finder Trash (or the sibling backup). The helper will compare that path with the journaled source snapshot, inode, and device before linking.
+4. Dry-run and execute `link` with `--recovery-path "/exact/Finder/Trash/or/sibling-backup" --finder-handoff-verified`; execute only after the user reviews both exact paths. It creates only a symlink.
 5. Keep the recovery copy in Trash (or the sibling backup) through real read, write, full quit, relaunch, and updater tests.
 6. Confirm that new writes land externally and no new large internal directory appears.
 7. After the user confirms success, explain that the internal source in Trash may be permanently deleted. Emptying Trash requires a fresh action-time confirmation and must not silently remove unrelated items.

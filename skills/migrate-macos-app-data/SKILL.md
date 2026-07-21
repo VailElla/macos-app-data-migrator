@@ -53,10 +53,11 @@ python3 scripts/migrate_app_data.py copy \
 ```bash
 python3 scripts/migrate_app_data.py verify \
   --source "/exact/source/path" \
-  --destination "/Volumes/External/ExactDestination"
+  --destination "/Volumes/External/ExactDestination" \
+  --process-name "ExactProcessName"
 ```
 
-`verify` 对每个普通文件重新计算源与目标 SHA-256，并比较目录树、类型、权限、ACL、扩展属性、软链接目标和硬链接结构；`.app` 根目录上明确列出的 macOS 实例属性允许不同，macOS 仅在目标 `.app` 任一条目新增的受保护 `com.apple.provenance` 也允许存在，但源端已有的同名属性仍须完全一致。普通数据与其他所有 xattr 保持严格比较。`.app` 还必须通过 `codesign --verify --deep --strict`。校验开始前和写入 `verified` 状态前都会复查日志中记录的程序、更新器和辅助进程仍已退出。校验时源路径必须仍是实体目录，因此不能提前清理内置盘。
+`verify` 对每个普通文件重新计算源与目标 SHA-256，并比较目录树、类型、权限、ACL、扩展属性、软链接目标和硬链接结构；`.app` 根目录上脚本明确列出的 macOS 实例属性（包括 `com.apple.provenance`）属于实例元数据，允许源目标不同；应用包内部条目只允许目标端新增的受保护 `com.apple.provenance`，若源端已有则源目标必须完全一致。普通数据与其他所有 xattr 保持严格比较。`.app` 还必须通过 `codesign --verify --deep --strict`。校验开始前和写入 `verified` 状态前都会复查日志中记录的程序、更新器和辅助进程仍已退出。新建复制日志必须至少记录一个相关进程；旧日志可在此处追加一个或多个 `--process-name` 后修复，缺少进程名时安全停止。校验时源路径必须仍是实体目录，因此不能提前清理内置盘。
 
 ### 4A. 程序 `.app` 的访达交接
 
@@ -72,24 +73,28 @@ python3 scripts/migrate_app_data.py reveal \
 
 交接回复必须用文本提供一个直接指向内置 `.app` 的可点击本地文件链接，例如 `[在访达中选择内置 App.app](/Applications/App.app)`；不能只链接 `/Applications` 父目录或只让用户自己寻找。链接目标必须是本轮已核对的精确源路径。若当前客户端不能打开本地文件链接，再以 `reveal` 作为后备定位方式。链接只负责选择目标，仍由用户亲自在访达中移到废纸篓。
 
-为了在访达中区分副本，默认保留真实 `.app` 文件名，避免未经验证的改名影响更新器；在完整校验后给外接副本写入访达备注 `应用名（外接版）`。准确迁移路径仍按真实文件名记录。`.app` 根目录的访达备注及脚本列出的 macOS 实例属性不参与负载元数据比较；应用内部条目只允许目标端新增的受保护 `com.apple.provenance` 这一项实例例外，源端已有 provenance 和其他全部 xattr 仍须严格一致。普通数据没有这项例外。
+为了在访达中区分副本，默认保留真实 `.app` 文件名，避免未经验证的改名影响更新器；在完整校验后给外接副本写入访达备注 `应用名（外接版）`。准确迁移路径仍按真实文件名记录。`.app` 根目录的访达备注及脚本列出的 macOS 实例属性（包括 `com.apple.provenance`）不参与负载元数据比较；应用内部条目只允许目标端新增的受保护 `com.apple.provenance` 这一项实例例外，源端已有 provenance 和其他全部 xattr 仍须严格一致。普通数据没有这项例外。
 
 ### 4B. 数据目录的访达交接
 
-完整校验后运行 `reveal`。默认在用户明确授权后，由 Codex 通过访达界面把准确的内置源目录移到系统废纸篓，但绝不清空废纸篓；操作前后都要核对源路径，确保外接副本仍可用。这样会立即腾出原路径，同时保留“放回原处”的回滚能力。若用户明确偏好同级备份，再改用 `原名.internal-backup` 的可回滚同卷改名。两种交接都不能改用终端 `mv` 或删除命令。确认原路径已腾出后，预演并建立一个很小的软链接：
+完整校验后运行 `reveal`。默认在用户明确授权后，由 Codex 通过访达界面把准确的内置源目录移到系统废纸篓，但绝不清空废纸篓；操作前后都要核对源路径，确保外接副本仍可用。这样会立即腾出原路径，同时保留“放回原处”的回滚能力。若用户明确偏好同级备份，再改用 `原名.internal-backup` 的可回滚同卷改名。两种交接都不能改用终端 `mv` 或删除命令。确认原路径已腾出后，找到访达废纸篓中的准确恢复项目（或用户明确选择的同级 `.internal-backup`），再用源快照、inode 和设备号证明它仍是原目录。预演并建立一个很小的软链接：
 
 ```bash
 python3 scripts/migrate_app_data.py link \
   --source "/exact/original/data" \
-  --destination "/Volumes/External/ExactDestination"
+  --destination "/Volumes/External/ExactDestination" \
+  --recovery-path "/exact/Finder/Trash/or/sibling-backup" \
+  --finder-handoff-verified
 
 python3 scripts/migrate_app_data.py link \
   --source "/exact/original/data" \
   --destination "/Volumes/External/ExactDestination" \
+  --recovery-path "/exact/Finder/Trash/or/sibling-backup" \
+  --finder-handoff-verified \
   --execute
 ```
 
-如果程序使用原生存储设置或安全作用域适配器，不要建立软链接；按该适配器配置目标。软链接只占极少量文件系统元数据，这是保留原路径兼容性所需的唯一内置盘写入。
+`--recovery-path` 必须是访达废纸篓中的准确恢复项目，或用户明确选择的同级 `.internal-backup`；`--finder-handoff-verified` 是对访达完成授权交接的明确确认。工具会比较该路径与日志中的源快照、inode 和设备号，交接收据不匹配时拒绝建立链接。如果程序使用原生存储设置或安全作用域适配器，不要建立软链接；按该适配器配置目标。软链接只占极少量文件系统元数据，这是保留原路径兼容性所需的唯一内置盘写入。
 
 ### 5. 真实验证后才释放空间
 
@@ -121,13 +126,13 @@ For an unfamiliar app, read [Compatibility (English)](references/compatibility.e
 
 ### 2. Dry-run and copy to external APFS
 
-Quit the app, updater, and every helper. The destination parent must already exist on a mounted external APFS volume. Run the `copy` command without `--execute`, review every character of both paths, then repeat the same command with `--execute`.
+Quit the app, updater, and every helper. The destination parent must already exist on a mounted external APFS volume. A new journal must include at least one `--process-name` for the app, updater, or helper; repeat the same flag for each relevant process. Run the `copy` command without `--execute`, review every character of both paths, then repeat the same command with `--execute`.
 
 The copier SHA-256 checks each file, preserves symlinks, hardlinks, ACLs, extended attributes, and resource forks, and stores resumable state beside the external destination. It never deletes source content.
 
 ### 3. Fully verify while the source still exists
 
-Run the `verify` command shown above. It re-hashes every regular file and compares the complete tree, entry types, permissions, ACLs, extended attributes, symlink targets, and hardlink topology. Explicitly listed macOS instance attributes on the `.app` root may differ. A protected `com.apple.provenance` added by macOS only to the destination may also appear on any app entry, but source-present provenance must match exactly; data migrations and every other xattr remain strict. An app bundle must also pass strict deep code-signature verification. The recorded app, updater, and helper processes are checked before verification and again before committing `verified` state. The source must remain a real directory during this gate.
+Run the `verify` command shown above. It re-hashes every regular file and compares the complete tree, entry types, permissions, ACLs, extended attributes, symlink targets, and hardlink topology. Script-listed macOS instance attributes on the `.app` root (including `com.apple.provenance`) are instance metadata and may differ between source and destination. For app descendants, only a destination-only protected `com.apple.provenance` is allowed; when the source already has it, source and destination must match exactly. Data migrations and every other xattr remain strict. An app bundle must also pass strict deep code-signature verification. A new copy journal must record at least one app, updater, or helper process; add one or more `--process-name` values here when repairing a legacy journal, and stop safely when none are available. The recorded processes are checked before verification and again before committing `verified` state. The source must remain a real directory during this gate.
 
 ### 4A. Finder handoff for an `.app`
 
@@ -135,11 +140,11 @@ Launch the verified app directly from the external volume. Test sign-in, existin
 
 The handoff response must provide a clickable local-file link that targets the exact verified internal `.app`, for example `[Select the internal App.app in Finder](/Applications/App.app)`. Do not link only to the `/Applications` parent or make the user locate the bundle manually. Use `reveal` as a fallback when the client cannot open local-file links. The link selects the target; the user still moves it to Trash in Finder.
 
-Keep the real `.app` filename unless updater compatibility with renaming has been proven. After full verification, add the Finder comment `App Name (External)` to identify the external copy while preserving its exact path. The Finder comment and listed macOS instance attributes on the `.app` root are excluded from payload-metadata comparison. Within app descendants, the only instance exception is destination-only protected `com.apple.provenance`; source-present provenance and every other xattr must still match exactly. Data migrations have no such exception.
+Keep the real `.app` filename unless updater compatibility with renaming has been proven. After full verification, add the Finder comment `App Name (External)` to identify the external copy while preserving its exact path. The Finder comment and listed macOS instance attributes on the `.app` root (including `com.apple.provenance`) are excluded from payload-metadata comparison. Within app descendants, the only instance exception is destination-only protected `com.apple.provenance`; source-present provenance and every other xattr must still match exactly. Data migrations have no such exception.
 
 ### 4B. Finder handoff for a data directory
 
-After full verification, run `reveal`. By default, after explicit user authorization, use the Finder UI to move the exact internal source directory to system Trash without emptying Trash; verify the exact source path before and after and keep the external copy available. This frees the original path while preserving Finder's Put Back rollback. Use a reversible same-volume rename to `Name.internal-backup` only when the user explicitly prefers a sibling backup. Never substitute Terminal `mv` or a deletion command for either handoff. After the original path is free, dry-run and execute `link`. If the app uses a native location setting or a security-scoped adapter, configure that instead of creating a symlink.
+After full verification, run `reveal`. By default, after explicit user authorization, use the Finder UI to move the exact internal source directory to system Trash without emptying Trash; verify the exact source path before and after and keep the external copy available. This frees the original path while preserving Finder's Put Back rollback. Use a reversible same-volume rename to `Name.internal-backup` only when the user explicitly prefers a sibling backup. Never substitute Terminal `mv` or a deletion command for either handoff. Before `link`, provide the exact recovery path and the explicit Finder-handoff attestation; the helper compares the saved source snapshot, inode, and device before creating a symlink. If the app uses a native location setting or a security-scoped adapter, configure that instead of creating a symlink.
 
 A symlink consumes only a small amount of filesystem metadata; it is the only intentional internal write when original-path compatibility is required.
 

@@ -161,6 +161,8 @@ def copy_arguments(source: Path, destination: Path) -> list[str]:
         str(source),
         "--destination",
         str(destination),
+        "--process-name",
+        "NoSuchMigratorProcess",
     ]
 
 
@@ -365,6 +367,49 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(state["status"], "copied")
             write_state.assert_not_called()
 
+    def test_process_names_are_required_and_legacy_journals_can_be_repaired(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-process-journal-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = self.external_parent("process-journal") / "Data"
+            write_file(source / "payload.bin", b"process guard")
+
+            missing = run_migrator(
+                "copy",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--execute",
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("At least one --process-name is required", missing.stderr)
+            self.assertFalse(destination.exists())
+
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            state_path = destination.parent / f".{destination.name}.migrate-macos-app-data.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.pop("process_names")
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            legacy_refused = run_migrator(
+                "verify", "--source", str(source), "--destination", str(destination), check=False
+            )
+            self.assertEqual(legacy_refused.returncode, 2)
+            self.assertIn("At least one --process-name is required", legacy_refused.stderr)
+
+            repaired = run_migrator(
+                "verify",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--process-name",
+                "NoSuchMigratorProcess",
+            )
+            self.assertIn("Full verification passed", repaired.stdout)
+
     def test_app_bundle_cannot_be_downgraded_to_data_kind(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-kind-app-") as temporary:
             root = Path(temporary)
@@ -423,8 +468,6 @@ class MigrationTests(unittest.TestCase):
             before = source_snapshot(source)
             run_migrator(
                 *copy_arguments(source, destination),
-                "--process-name",
-                "NoSuchMigratorProcess",
                 "--execute",
             )
             self.assertEqual(source_snapshot(source), before)
@@ -499,18 +542,40 @@ class MigrationTests(unittest.TestCase):
             backup = source.with_name(f"{source.name}.internal-backup")
             os.rename(source, backup)
             dry_run = run_migrator(
-                "link", "--source", str(source), "--destination", str(destination)
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(backup),
+                "--finder-handoff-verified",
             )
             self.assertIn("Dry run only", dry_run.stdout)
             self.assertFalse(os.path.lexists(source))
 
             run_migrator(
-                "link", "--source", str(source), "--destination", str(destination), "--execute"
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(backup),
+                "--finder-handoff-verified",
+                "--execute",
             )
             self.assertTrue(source.is_symlink())
             self.assertEqual(source.resolve(), destination.resolve())
             self.assertTrue(backup.is_dir())
             self.assertEqual((backup / "content.bin").read_bytes(), b"safe content")
+            linked_state = json.loads(
+                (destination.parent / f".{destination.name}.migrate-macos-app-data.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(linked_state["handoff_receipt"]["recovery_path"], str(backup))
+            self.assertTrue(linked_state["handoff_receipt"]["snapshot_matches"])
 
             backup_reveal = run_migrator(
                 "reveal",
@@ -539,16 +604,69 @@ class MigrationTests(unittest.TestCase):
             trashed_source = simulated_trash / source.name
             os.rename(source, trashed_source)
 
-            dry_run = run_migrator("link", "--source", str(source), "--destination", str(destination))
+            missing_receipt = run_migrator(
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--finder-handoff-verified",
+                check=False,
+            )
+            self.assertEqual(missing_receipt.returncode, 2)
+            self.assertIn("Exact recovery path is required", missing_receipt.stderr)
+
+            wrong_recovery = root / "Not-The-Source"
+            write_file(wrong_recovery / "content.bin", b"different tree")
+            mismatch = run_migrator(
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(wrong_recovery),
+                "--finder-handoff-verified",
+                check=False,
+            )
+            self.assertEqual(mismatch.returncode, 2)
+            self.assertIn("does not match the journaled source tree", mismatch.stderr)
+
+            dry_run = run_migrator(
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(trashed_source),
+                "--finder-handoff-verified",
+            )
             self.assertIn("does not empty Trash", dry_run.stdout)
             self.assertFalse(os.path.lexists(source))
 
             run_migrator(
-                "link", "--source", str(source), "--destination", str(destination), "--execute"
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(trashed_source),
+                "--finder-handoff-verified",
+                "--execute",
             )
             self.assertTrue(source.is_symlink())
             self.assertEqual(source.resolve(), destination.resolve())
             self.assertEqual((trashed_source / "content.bin").read_bytes(), b"recoverable source")
+            linked_state = json.loads(
+                (destination.parent / f".{destination.name}.migrate-macos-app-data.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                linked_state["handoff_receipt"]["recovery_path"], str(trashed_source)
+            )
 
     def test_dry_run_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-dry-") as temporary:
@@ -774,6 +892,18 @@ class MigrationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Metadata differs"):
                 MIGRATOR_MODULE.full_verify(source, destination, kind="app")
+
+    def test_full_verify_allows_root_provenance_instance_difference(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-root-provenance-") as temporary:
+            root = Path(temporary)
+            source = root / "Source.app"
+            destination = root / "Destination.app"
+            write_file(source / "Contents" / "Info.plist", b"identical app payload")
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+            write_xattr(source, "com.apple.provenance", b"source-root-instance")
+            write_xattr(destination, "com.apple.provenance", b"destination-root-instance")
+
+            MIGRATOR_MODULE.full_verify(source, destination, kind="app")
 
     def test_full_verify_scopes_destination_only_app_provenance(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-provenance-") as temporary:
@@ -1021,6 +1151,8 @@ class MigrationTests(unittest.TestCase):
                 str(copied_app),
                 "--kind",
                 "app",
+                "--process-name",
+                "NoSuchMigratorProcess",
                 "--execute",
             )
             verified = run_migrator(

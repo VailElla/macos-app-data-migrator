@@ -11,7 +11,7 @@ It records exact paths, the starting source-tree snapshot, progress, hardlink ma
 ## Interrupted copy
 
 - The migration helper has not deleted or renamed the source app/data. It remains the primary recovery point.
-- Reconnect the same external volume, confirm its mount path and volume UUID, and repeat the exact same `copy ... --execute` command.
+- Reconnect the same external volume, confirm its mount path and volume UUID, and repeat the exact same `copy ... --process-name ... --execute` command; a journal without a process name is refused.
 - Completed destination files are re-hashed. Matching files are skipped; differing files are never overwritten. The helper may rewrite only a partial bearing its own migration ID inside the external destination.
 - Never create a same-named directory while the mount is absent, and do not delete the journal to “start over.”
 
@@ -24,7 +24,7 @@ It records exact paths, the starting source-tree snapshot, progress, hardlink ma
 
 ## Finder handoff completed, link not yet created
 
-For the default Trash handoff, cancel by selecting the exact original data directory in Trash and choosing Put Back. Confirm that the original path is restored before launching the app. If the user selected a sibling backup instead, rename `Name.internal-backup` to its original name in Finder. No source data must be copied back from external storage in either case.
+For the default Trash handoff, cancel by selecting the exact original data directory in Trash and choosing Put Back. Confirm that the original path is restored before launching the app. If linking is still desired, pass the exact recovery path from Finder to `link --recovery-path` together with `--finder-handoff-verified`; the helper refuses a path whose snapshot, inode, or device does not match the journal. If the user selected a sibling backup instead, rename `Name.internal-backup` to its original name in Finder. No source data must be copied back from external storage in either case.
 
 ## Symlink created, app behavior test failed
 

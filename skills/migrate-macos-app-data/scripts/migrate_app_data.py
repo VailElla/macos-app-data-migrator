@@ -469,6 +469,33 @@ def require_processes_stopped(names: List[str]) -> None:
         )
 
 
+def merged_process_names(
+    state: Dict[str, Any], supplied: Optional[List[str]] = None, *, required: bool
+) -> List[str]:
+    """Validate and merge journal/process arguments without treating omission as safety."""
+    saved = state.get("process_names", [])
+    if saved is None:
+        saved = []
+    if not isinstance(saved, list) or any(
+        not isinstance(name, str) or not name for name in saved
+    ):
+        raise MigrationError("Migration journal process list is invalid / 迁移日志进程列表无效")
+
+    requested = [] if supplied is None else supplied
+    if not isinstance(requested, list) or any(
+        not isinstance(name, str) or not name for name in requested
+    ):
+        raise MigrationError("Process name is invalid / 进程名无效")
+
+    process_names = sorted(set(saved) | set(requested))
+    if required and not process_names:
+        raise MigrationError(
+            "At least one --process-name is required; record the app, updater, or helper "
+            "process before continuing / 至少需要一个 --process-name；请先记录应用、更新器或辅助进程"
+        )
+    return process_names
+
+
 class DestinationGuard:
     def __init__(self, parent: Path, volume: Dict[str, Any], process_names: List[str]) -> None:
         self.parent = parent
@@ -1071,12 +1098,7 @@ def command_copy(arguments: argparse.Namespace) -> None:
             snapshot,
         )
 
-    saved_process_names = state.get("process_names", [])
-    if not isinstance(saved_process_names, list) or any(
-        not isinstance(name, str) or not name for name in saved_process_names
-    ):
-        raise MigrationError("Migration journal process list is invalid / 迁移日志进程列表无效")
-    process_names = sorted(set(saved_process_names) | set(arguments.process_name))
+    process_names = merged_process_names(state, arguments.process_name, required=True)
     state["process_names"] = process_names
     require_processes_stopped(process_names)
 
@@ -1361,11 +1383,10 @@ def command_verify(arguments: argparse.Namespace) -> None:
     require_journal_destination(destination, state)
     if state.get("status") not in {"copied", "verified", "linked"}:
         raise MigrationError("Copy has not completed / 复制尚未完成")
-    process_names = state.get("process_names", [])
-    if not isinstance(process_names, list) or any(
-        not isinstance(name, str) or not name for name in process_names
-    ):
-        raise MigrationError("Migration journal process list is invalid / 迁移日志进程列表无效")
+    process_names = merged_process_names(
+        state, getattr(arguments, "process_name", None), required=True
+    )
+    state["process_names"] = process_names
     require_processes_stopped(process_names)
 
     hashes = full_verify(source, destination, str(state["kind"]))
@@ -1407,6 +1428,69 @@ def validate_reveal_path(source: Path, requested: Optional[str]) -> Path:
     return candidate
 
 
+def validate_recovery_receipt(
+    source: Path,
+    destination: Path,
+    state: Dict[str, Any],
+    recovery_path: Path,
+) -> Dict[str, Any]:
+    """Prove that the supplied Finder recovery path is the journaled source tree."""
+    if recovery_path == source or recovery_path == destination or is_within(recovery_path, destination):
+        raise MigrationError(
+            "Recovery path must be separate from source and destination / "
+            "恢复路径必须独立于源路径和目标路径"
+        )
+    if recovery_path.is_symlink() or not recovery_path.is_dir():
+        raise MigrationError(
+            f"Recovery path is not a real directory / 恢复路径不是实体目录: {recovery_path}"
+        )
+
+    expected_snapshot = state.get("source_snapshot")
+    if not isinstance(expected_snapshot, dict) or "." not in expected_snapshot:
+        raise MigrationError(
+            "Migration journal has no source snapshot for handoff proof / "
+            "迁移日志没有可用于交接证明的源快照"
+        )
+    try:
+        actual_snapshot = source_snapshot(recovery_path)
+    except OSError as error:
+        raise MigrationError(
+            f"Cannot inspect recovery path / 无法检查恢复路径: {recovery_path}: {error}"
+        ) from error
+    if actual_snapshot != expected_snapshot:
+        raise MigrationError(
+            "Recovery path does not match the journaled source tree / "
+            "恢复路径与日志中的源目录树不一致"
+        )
+
+    root_record = actual_snapshot["."]
+    return {
+        "recovery_path": str(recovery_path),
+        "device": root_record.get("device"),
+        "inode": root_record.get("inode"),
+        "snapshot_matches": True,
+        "verified_at": time.time(),
+    }
+
+
+def require_saved_handoff_receipt(
+    source: Path, destination: Path, state: Dict[str, Any]
+) -> Dict[str, Any]:
+    receipt = state.get("handoff_receipt")
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("recovery_path"), str):
+        raise MigrationError(
+            "Migration journal has no Finder handoff receipt; repeat link with --recovery-path "
+            "and --finder-handoff-verified / 迁移日志没有访达交接收据；请使用 --recovery-path 和 "
+            "--finder-handoff-verified 重新执行 link"
+        )
+    return validate_recovery_receipt(
+        source,
+        destination,
+        state,
+        lexical_absolute(receipt["recovery_path"]),
+    )
+
+
 def command_reveal(arguments: argparse.Namespace) -> None:
     source = lexical_absolute(arguments.source)
     destination = lexical_absolute(arguments.destination)
@@ -1417,6 +1501,7 @@ def command_reveal(arguments: argparse.Namespace) -> None:
     if destination.is_symlink() or not destination.is_dir():
         raise MigrationError("Verified destination is unavailable / 已校验目标不可用")
     require_journal_destination(destination, state)
+    merged_process_names(state, required=True)
     if state.get("status") not in {"verified", "linked"}:
         raise MigrationError("Full verification is required first / 必须先完成完整校验")
     reveal_path = validate_reveal_path(source, arguments.path)
@@ -1452,9 +1537,11 @@ def command_link(arguments: argparse.Namespace) -> None:
     if not destination.is_dir() or destination.is_symlink():
         raise MigrationError("Verified destination is unavailable / 已校验目标不可用")
     require_journal_destination(destination, state)
+    merged_process_names(state, required=True)
 
     if source.is_symlink():
         if source.resolve(strict=False) == destination.resolve(strict=True):
+            require_saved_handoff_receipt(source, destination, state)
             state["status"] = "linked"
             write_state(state_path_for(destination), state)
             print("Source link already points to destination / 原路径软链接已指向目标")
@@ -1473,8 +1560,22 @@ def command_link(arguments: argparse.Namespace) -> None:
         raise MigrationError(
             "Source parent is not user-writable; do not use sudo / 当前用户不可写入源路径上级目录，请勿使用 sudo"
         )
+    if not getattr(arguments, "finder_handoff_verified", False):
+        raise MigrationError(
+            "Explicit Finder handoff attestation is required; confirm that the source is in "
+            "Finder Trash or the explicitly selected sibling backup / 必须明确确认已完成访达交接；"
+            "请确认源已在访达废纸篓或明确选择的同级备份中"
+        )
+    recovery_argument = getattr(arguments, "recovery_path", None)
+    if not recovery_argument:
+        raise MigrationError(
+            "Exact recovery path is required for handoff proof / 必须提供准确恢复路径以证明交接可回滚"
+        )
+    recovery_path = lexical_absolute(recovery_argument)
+    handoff_receipt = validate_recovery_receipt(source, destination, state, recovery_path)
 
     print(f"Link / 链接: {source} -> {destination}")
+    print(f"Recovery receipt / 恢复收据: {recovery_path}")
     print("This creates only a small symlink; it does not empty Trash or delete the Finder recovery copy / 仅建立小型软链接，不清空废纸篓或删除访达恢复副本")
     if not arguments.execute:
         print("Dry run only / 仅预演；审核后添加 --execute")
@@ -1482,6 +1583,7 @@ def command_link(arguments: argparse.Namespace) -> None:
     os.symlink(str(destination), str(source))
     state["status"] = "linked"
     state["linked_at"] = time.time()
+    state["handoff_receipt"] = handoff_receipt
     write_state(state_path_for(destination), state)
     print("Link created. Keep the Finder recovery copy until the app passes a real smoke test / 链接已建立；应用实测通过前请保留访达恢复副本")
 
@@ -1509,6 +1611,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify", help="full source-to-destination verification / 完整源目标校验")
     verify.add_argument("--source", required=True)
     verify.add_argument("--destination", required=True)
+    verify.add_argument("--process-name", action="append", default=[])
     verify.set_defaults(handler=command_verify)
 
     reveal = subparsers.add_parser("reveal", help="reveal source or backup in Finder / 在访达定位源或备份")
@@ -1521,6 +1624,15 @@ def build_parser() -> argparse.ArgumentParser:
     link = subparsers.add_parser("link", help="create a symlink after Finder handoff / 访达交接后建立软链接")
     link.add_argument("--source", required=True)
     link.add_argument("--destination", required=True)
+    link.add_argument(
+        "--recovery-path",
+        help="exact path of the Finder Trash or sibling-backup recovery copy / 访达废纸篓或同级备份中的准确恢复路径",
+    )
+    link.add_argument(
+        "--finder-handoff-verified",
+        action="store_true",
+        help="attest that Finder completed the authorized handoff / 明确确认访达已完成授权交接",
+    )
     link.add_argument("--execute", action="store_true")
     link.set_defaults(handler=command_link)
     return parser
