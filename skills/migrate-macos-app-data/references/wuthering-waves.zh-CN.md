@@ -15,7 +15,7 @@
 ## 安全迁移顺序
 
 1. 完全退出鸣潮及 `Client-Mac-Shipping` 等辅助进程。
-2. 对准确的 `Resources` 先执行 `audit` 和不带 `--execute` 的 `copy` 预演；逐字符复核路径后执行相同的 `copy --execute`，最后运行 `verify`。源 `Resources` 在完整校验前保持不变。
+2. 对准确的 `Resources` 先执行 `audit` 和不带 `--execute` 的 `copy` 预演，并用 `--process-name` 记录相关游戏/启动器/辅助进程；逐字符复核路径后执行相同的 `copy --execute`，最后运行 `verify`。源 `Resources` 在完整校验前保持不变。
 3. 如需迁移游戏 `.app`，作为独立组件用 `--kind app` 复制、验证签名，并从外接盘实测启动。
 4. 在外接 APFS 上预先建立启动器上级目录。
 5. 使用下面的构建器；所有 Swift 缓存、临时文件和生成物都位于 `--output-app` 所在的目标宗卷。
@@ -61,4 +61,4 @@ log show --last 3m --style compact \
   --predicate 'eventMessage CONTAINS[c] "WutheringWaves"' | grep -Ei 'deny|sandbox'
 ```
 
-启动器重建后，ad-hoc code hash 会改变。macOS 可能要求先关闭再开启辅助功能条目。只有完成以上实测，才按访达交接文档处理内置 `Resources.internal-backup` 或内置游戏 `.app`。
+启动器重建后，ad-hoc code hash 会改变。macOS 可能要求先关闭再开启辅助功能条目。只有完成以上实测，才按访达交接文档处理准确的内置 `Resources` 源目录（默认移到废纸篓；只有明确选择时才使用 `Resources.internal-backup`）或内置游戏 `.app`。

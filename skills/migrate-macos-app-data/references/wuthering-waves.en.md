@@ -15,7 +15,7 @@ Wuthering Waves is App Sandbox constrained. Even when Finder follows an original
 ## Safe migration order
 
 1. Fully quit Wuthering Waves and helpers such as `Client-Mac-Shipping`.
-2. Run `audit` and a `copy` dry run without `--execute` for the exact `Resources`. Review both paths character by character, repeat the same command with `--execute`, and then run `verify`. Keep the source unchanged through full verification.
+2. Run `audit` and a `copy` dry run without `--execute` for the exact `Resources`, including `--process-name` for each relevant game/launcher/helper process. Review both paths character by character, repeat the same command with `--execute`, and then run `verify`. Keep the source unchanged through full verification.
 3. If moving the game `.app`, treat it as a separate `--kind app` component, verify its signature, and smoke-test external launch.
 4. Pre-create the launcher parent directory on external APFS.
 5. Run the builder below. Every Swift cache, temporary file, and generated artifact stays on the `--output-app` volume.
@@ -61,4 +61,4 @@ log show --last 3m --style compact \
   --predicate 'eventMessage CONTAINS[c] "WutheringWaves"' | grep -Ei 'deny|sandbox'
 ```
 
-Rebuilding changes the ad-hoc code hash, so macOS may require toggling the Accessibility entry. Only after the live gates pass should the Finder handoff handle internal `Resources.internal-backup` or the internal game `.app`.
+Rebuilding changes the ad-hoc code hash, so macOS may require toggling the Accessibility entry. Only after the live gates pass should the Finder handoff handle the exact internal `Resources` source (Trash by default; `Resources.internal-backup` only when explicitly selected) or the internal game `.app`.

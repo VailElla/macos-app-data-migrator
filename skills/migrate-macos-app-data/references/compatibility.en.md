@@ -39,7 +39,7 @@ Treat `Sandboxed: yes` as an unproven-symlink warning. Prefer the app's settings
 
 - Production migration accepts only a volume `diskutil` explicitly identifies as external APFS; the production CLI exposes no internal-volume override.
 - exFAT, NTFS, network filesystems, and cloud drives can lose ACLs, extended attributes, resource forks, hardlinks, permissions, or case semantics and are rejected by default.
-- Quit the app, launcher, updater, and helpers. The copier re-checks named processes periodically.
+- Quit the app, launcher, updater, and helpers. A new `copy` journal must include at least one `--process-name` for the discovered app/updater/helper processes, and the copier re-checks those names periodically.
 - Require a stable external mount path. Stop immediately on disconnection; never continue into an internal directory that happens to have the same name.
 - Quit the app before ejecting the volume. Re-test signatures, links/location settings, and real I/O after major updates.
 

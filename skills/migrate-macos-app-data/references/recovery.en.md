@@ -11,7 +11,7 @@ It records exact paths, the starting source-tree snapshot, progress, hardlink ma
 ## Interrupted copy
 
 - The migration helper has not deleted or renamed the source app/data. It remains the primary recovery point.
-- Reconnect the same external volume, confirm its mount path and volume UUID, and repeat the exact same `copy ... --execute` command.
+- Reconnect the same external volume, confirm its mount path and volume UUID, and repeat the exact same `copy ... --process-name ... --execute` command; a journal without a process name is refused.
 - Completed destination files are re-hashed. Matching files are skipped; differing files are never overwritten. The helper may rewrite only a partial bearing its own migration ID inside the external destination.
 - Never create a same-named directory while the mount is absent, and do not delete the journal to “start over.”
 
@@ -22,15 +22,15 @@ It records exact paths, the starting source-tree snapshot, progress, hardlink ma
 - A SHA-256, metadata, ACL, extended-attribute, or signature failure blocks Finder cleanup.
 - If the user eventually abandons the external copy, the user may manage those external generated files in Finder. Never substitute a Terminal deletion of the internal source.
 
-## Finder rename completed, link not yet created
+## Finder handoff completed, link not yet created
 
-To cancel, the user renames `Name.internal-backup` to its original name in Finder. No source data must be copied back from external storage.
+For the default Trash handoff, cancel by selecting the exact original data directory in Trash and choosing Put Back. Confirm that the original path is restored before launching the app. If linking is still desired, pass the exact recovery path from Finder to `link --recovery-path` together with `--finder-handoff-verified`; the helper refuses a path whose snapshot, inode, or device does not match the journal. If the user selected a sibling backup instead, rename `Name.internal-backup` to its original name in Finder. No source data must be copied back from external storage in either case.
 
 ## Symlink created, app behavior test failed
 
 1. Quit the app and every helper.
 2. Reveal the original path in Finder; the user moves the symlink to Trash.
-3. The user renames the sibling `Name.internal-backup` to the original name.
+3. By default, select the original data directory in Trash and choose Put Back. If a sibling backup was used, rename `Name.internal-backup` to the original name.
 4. Launch against the internal source and confirm recovery.
 5. Retain the external copy and journal while diagnosing. A sandbox denial commonly means a plain symlink is insufficient.
 
@@ -40,7 +40,7 @@ This rollback requires neither an administrator password nor a Terminal deletion
 
 Launch the internal `.app` again. Do not move or delete it. If the user abandons the external copy, the user can manage that external `.app` in Finder.
 
-## Backup already moved to Trash
+## Source or sibling backup already in Trash
 
 - Trash not emptied: the user chooses Put Back in Finder, then follows the symlink rollback steps.
 - Trash emptied: preserve the only external copy. Returning it internally requires enough final capacity and a separately reviewed copy workflow; this skill does not pretend to provide lossless restoration into insufficient space.

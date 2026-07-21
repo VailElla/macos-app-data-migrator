@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -13,12 +15,25 @@ import unittest
 import uuid
 from pathlib import Path
 from typing import Any, Dict
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = REPO_ROOT / "skills" / "migrate-macos-app-data"
 MIGRATOR = SKILL_ROOT / "scripts" / "migrate_app_data.py"
 LAUNCHER_BUILDER = SKILL_ROOT / "scripts" / "build_wuthering_waves_launcher.sh"
+
+
+def load_migrator_module() -> Any:
+    spec = importlib.util.spec_from_file_location("migrate_app_data_for_tests", MIGRATOR)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"Unable to import migrator: {MIGRATOR}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MIGRATOR_MODULE = load_migrator_module()
 
 
 class ExternalAPFSTestVolume:
@@ -146,6 +161,8 @@ def copy_arguments(source: Path, destination: Path) -> list[str]:
         str(source),
         "--destination",
         str(destination),
+        "--process-name",
+        "NoSuchMigratorProcess",
     ]
 
 
@@ -215,6 +232,322 @@ class MigrationTests(unittest.TestCase):
         path.mkdir()
         return path
 
+    def test_state_writes_never_follow_temporary_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-state-victim-") as temporary:
+            victim = Path(temporary) / "must-remain-unchanged.txt"
+            victim.write_text("keep me", encoding="utf-8")
+            state_parent = self.external_parent("state-symlink")
+            state_path = state_parent / ".Data.migrate-macos-app-data.json"
+            migration_id = "a" * 32
+            state = {
+                "schema_version": 3,
+                "migration_id": migration_id,
+            }
+
+            old_predictable_temporary = state_parent / f".{state_path.name}.{migration_id}.tmp"
+            old_predictable_temporary.symlink_to(victim)
+            MIGRATOR_MODULE.write_state(state_path, state)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep me")
+            self.assertTrue(old_predictable_temporary.is_symlink())
+            self.assertTrue(state_path.is_file())
+
+            write_nonce = "b" * 32
+            exact_temporary = state_parent / f".{state_path.name}.{migration_id}.{write_nonce}.tmp"
+            exact_temporary.symlink_to(victim)
+            fake_uuid = mock.Mock(hex=write_nonce)
+            with mock.patch.object(MIGRATOR_MODULE.uuid, "uuid4", return_value=fake_uuid):
+                with self.assertRaises(MIGRATOR_MODULE.MigrationError):
+                    MIGRATOR_MODULE.write_state(state_path, state)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep me")
+
+    def test_full_verify_rejects_extra_destination_hardlinks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-hardlink-topology-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            for name in ("a.bin", "b.bin"):
+                write_file(source / name, b"identical payload")
+            fixed_ns = 1_700_000_000_000_000_000
+            for path in (source / "a.bin", source / "b.bin"):
+                os.utime(path, ns=(fixed_ns, fixed_ns))
+            shutil.copy2(source / "a.bin", destination / "a.bin")
+            os.link(destination / "a.bin", destination / "b.bin")
+            MIGRATOR_MODULE.copy_directory_metadata(source, destination)
+
+            with self.assertRaisesRegex(
+                MIGRATOR_MODULE.MigrationError,
+                "Hardlink topology differs",
+            ):
+                MIGRATOR_MODULE.full_verify(source, destination)
+
+    def test_full_verify_rejects_changes_after_a_file_was_checked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-verify-race-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            for name, payload in (("a.bin", b"A-original"), ("b.bin", b"B-original")):
+                write_file(source / name, payload)
+                shutil.copy2(source / name, destination / name)
+            MIGRATOR_MODULE.copy_directory_metadata(source, destination)
+
+            original_sha256 = MIGRATOR_MODULE.sha256_file
+            mutated = False
+
+            def mutate_after_first_file(path: Path) -> str:
+                nonlocal mutated
+                candidate = Path(path)
+                if not mutated and candidate == source / "b.bin":
+                    (destination / "a.bin").write_bytes(b"A-tampered-after-check")
+                    mutated = True
+                return original_sha256(candidate)
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "sha256_file",
+                side_effect=mutate_after_first_file,
+            ):
+                with self.assertRaisesRegex(
+                    MIGRATOR_MODULE.MigrationError,
+                    "Destination changed during verification",
+                ):
+                    MIGRATOR_MODULE.full_verify(source, destination)
+            self.assertNotEqual(
+                (source / "a.bin").read_bytes(),
+                (destination / "a.bin").read_bytes(),
+            )
+
+    def test_verify_rechecks_processes_before_committing_verified_state(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-verify-process-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = root / "external" / "Data"
+            source.mkdir(parents=True)
+            destination.mkdir(parents=True)
+            state = {
+                "schema_version": MIGRATOR_MODULE.SCHEMA_VERSION,
+                "migration_id": "a" * 32,
+                "source": str(source),
+                "destination": str(destination),
+                "kind": "data",
+                "status": "copied",
+                "process_names": ["ExampleProcess"],
+            }
+            arguments = argparse.Namespace(source=str(source), destination=str(destination))
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "load_state",
+                return_value=state,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "require_journal_destination",
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "process_is_running",
+                side_effect=[False, True],
+            ) as process_is_running, mock.patch.object(
+                MIGRATOR_MODULE,
+                "full_verify",
+                return_value={},
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "write_state",
+            ) as write_state:
+                with self.assertRaisesRegex(
+                    MIGRATOR_MODULE.MigrationError,
+                    "Quit these processes before continuing",
+                ):
+                    MIGRATOR_MODULE.command_verify(arguments)
+
+            self.assertEqual(process_is_running.call_count, 2)
+            self.assertEqual(state["status"], "copied")
+            write_state.assert_not_called()
+
+    def test_reveal_refuses_running_process_before_finder_handoff(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-reveal-process-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = root / "external" / "Data"
+            source.mkdir(parents=True)
+            destination.mkdir(parents=True)
+            state = {
+                "schema_version": MIGRATOR_MODULE.SCHEMA_VERSION,
+                "migration_id": "a" * 32,
+                "source": str(source),
+                "destination": str(destination),
+                "kind": "data",
+                "status": "verified",
+                "process_names": ["ExampleProcess"],
+            }
+            arguments = argparse.Namespace(
+                source=str(source),
+                destination=str(destination),
+                path=None,
+                print_only=True,
+            )
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "load_state",
+                return_value=state,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "require_journal_destination",
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "process_is_running",
+                return_value=True,
+            ) as process_is_running:
+                with self.assertRaisesRegex(
+                    MIGRATOR_MODULE.MigrationError,
+                    "Quit these processes before continuing",
+                ):
+                    MIGRATOR_MODULE.command_reveal(arguments)
+
+            process_is_running.assert_called_once_with("ExampleProcess")
+
+    def test_link_rechecks_processes_after_recovery_validation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-link-process-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = root / "external" / "Data"
+            recovery = root / "Trash" / "Data"
+            write_file(source / "payload.bin", b"recoverable source")
+            destination.mkdir(parents=True)
+            snapshot = MIGRATOR_MODULE.source_snapshot(source)
+            recovery.parent.mkdir()
+            os.rename(source, recovery)
+            state = {
+                "schema_version": MIGRATOR_MODULE.SCHEMA_VERSION,
+                "migration_id": "a" * 32,
+                "source": str(source),
+                "destination": str(destination),
+                "kind": "data",
+                "status": "verified",
+                "process_names": ["ExampleProcess"],
+                "source_snapshot": snapshot,
+            }
+            arguments = argparse.Namespace(
+                source=str(source),
+                destination=str(destination),
+                recovery_path=str(recovery),
+                finder_handoff_verified=True,
+                execute=True,
+            )
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "load_state",
+                return_value=state,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "require_journal_destination",
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "process_is_running",
+                side_effect=[False, True],
+            ) as process_is_running, mock.patch.object(
+                MIGRATOR_MODULE,
+                "write_state",
+            ) as write_state:
+                with self.assertRaisesRegex(
+                    MIGRATOR_MODULE.MigrationError,
+                    "Quit these processes before continuing",
+                ):
+                    MIGRATOR_MODULE.command_link(arguments)
+
+            self.assertEqual(process_is_running.call_count, 2)
+            self.assertFalse(os.path.lexists(source))
+            self.assertEqual((recovery / "payload.bin").read_bytes(), b"recoverable source")
+            self.assertEqual(state["status"], "verified")
+            write_state.assert_not_called()
+
+    def test_process_names_are_required_and_legacy_journals_can_be_repaired(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-process-journal-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = self.external_parent("process-journal") / "Data"
+            write_file(source / "payload.bin", b"process guard")
+
+            missing = run_migrator(
+                "copy",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--execute",
+                check=False,
+            )
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("At least one --process-name is required", missing.stderr)
+            self.assertFalse(destination.exists())
+
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            state_path = destination.parent / f".{destination.name}.migrate-macos-app-data.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state.pop("process_names")
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            legacy_refused = run_migrator(
+                "verify", "--source", str(source), "--destination", str(destination), check=False
+            )
+            self.assertEqual(legacy_refused.returncode, 2)
+            self.assertIn("At least one --process-name is required", legacy_refused.stderr)
+
+            repaired = run_migrator(
+                "verify",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--process-name",
+                "NoSuchMigratorProcess",
+            )
+            self.assertIn("Full verification passed", repaired.stdout)
+
+    def test_app_bundle_cannot_be_downgraded_to_data_kind(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-kind-app-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Example.app"
+            info_path = source / "Contents" / "Info.plist"
+            info_path.parent.mkdir(parents=True)
+            with info_path.open("wb") as handle:
+                plistlib.dump(
+                    {
+                        "CFBundleIdentifier": "test.example.app",
+                        "CFBundleExecutable": "Example",
+                    },
+                    handle,
+                )
+            result = run_migrator(
+                "audit",
+                "--source",
+                str(source),
+                "--destination",
+                "/Volumes/External/Applications/Example.app",
+                "--kind",
+                "data",
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("conflicts with detected kind app", result.stderr)
+
+            info_path.unlink()
+            invalid_bundle = run_migrator(
+                "audit",
+                "--source",
+                str(source),
+                "--destination",
+                "/Volumes/External/Applications/Example.app",
+                check=False,
+            )
+            self.assertEqual(invalid_bundle.returncode, 2)
+            self.assertIn("not a valid app bundle", invalid_bundle.stderr)
+
     def test_copy_verify_resume_and_links_preserve_source_exactly(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-copy-") as temporary:
             root = Path(temporary)
@@ -232,7 +565,10 @@ class MigrationTests(unittest.TestCase):
             os.symlink("nested", source / "directory-link")
 
             before = source_snapshot(source)
-            run_migrator(*copy_arguments(source, destination), "--execute")
+            run_migrator(
+                *copy_arguments(source, destination),
+                "--execute",
+            )
             self.assertEqual(source_snapshot(source), before)
             self.assertFalse(source.is_symlink())
             self.assertTrue((source / "resume-me.bin").is_file())
@@ -241,6 +577,7 @@ class MigrationTests(unittest.TestCase):
             state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(state["schema_version"], 3)
             self.assertEqual(state["status"], "copied")
+            self.assertEqual(state["process_names"], ["NoSuchMigratorProcess"])
             self.assertFalse(state["source_deleted_by_tool"])
 
             # Simulate an interruption after a normal file and one hardlink
@@ -269,7 +606,7 @@ class MigrationTests(unittest.TestCase):
                 (destination / "first-hardlink.bin").stat().st_ino,
             )
 
-    def test_finder_handoff_requires_manual_rename_before_link(self) -> None:
+    def test_finder_handoff_requires_source_path_to_be_free_before_link(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-finder-") as temporary:
             root = Path(temporary)
             source = root / "internal" / "App Data"
@@ -283,7 +620,9 @@ class MigrationTests(unittest.TestCase):
                 "link", "--source", str(source), "--destination", str(destination), "--execute", check=False
             )
             self.assertEqual(refused.returncode, 2)
-            self.assertIn("Rename it manually in Finder", refused.stderr)
+            self.assertIn("Complete the authorized Finder handoff first", refused.stderr)
+            self.assertIn("move it to Trash by default", refused.stderr)
+            self.assertIn("explicitly selected sibling backup", refused.stderr)
             self.assertTrue(source.is_dir())
 
             reveal = run_migrator(
@@ -295,23 +634,47 @@ class MigrationTests(unittest.TestCase):
                 "--print-only",
             )
             self.assertIn("Finder handoff", reveal.stdout)
+            self.assertIn("move the source to Trash", reveal.stdout)
+            self.assertIn("do not empty Trash", reveal.stdout)
 
-            # The test rename stands in for the explicit Finder action performed by a user.
+            # This test covers the explicitly selected sibling-backup fallback.
             backup = source.with_name(f"{source.name}.internal-backup")
             os.rename(source, backup)
             dry_run = run_migrator(
-                "link", "--source", str(source), "--destination", str(destination)
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(backup),
+                "--finder-handoff-verified",
             )
             self.assertIn("Dry run only", dry_run.stdout)
             self.assertFalse(os.path.lexists(source))
 
             run_migrator(
-                "link", "--source", str(source), "--destination", str(destination), "--execute"
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(backup),
+                "--finder-handoff-verified",
+                "--execute",
             )
             self.assertTrue(source.is_symlink())
             self.assertEqual(source.resolve(), destination.resolve())
             self.assertTrue(backup.is_dir())
             self.assertEqual((backup / "content.bin").read_bytes(), b"safe content")
+            linked_state = json.loads(
+                (destination.parent / f".{destination.name}.migrate-macos-app-data.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(linked_state["handoff_receipt"]["recovery_path"], str(backup))
+            self.assertTrue(linked_state["handoff_receipt"]["snapshot_matches"])
 
             backup_reveal = run_migrator(
                 "reveal",
@@ -324,6 +687,85 @@ class MigrationTests(unittest.TestCase):
                 "--print-only",
             )
             self.assertIn(str(backup), backup_reveal.stdout)
+
+    def test_finder_trash_handoff_allows_link_with_recoverable_source(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-finder-trash-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "App Data"
+            destination = self.external_parent("finder-trash") / "App Data"
+            write_file(source / "content.bin", b"recoverable source")
+
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            run_migrator("verify", "--source", str(source), "--destination", str(destination))
+
+            simulated_trash = root / "Trash"
+            simulated_trash.mkdir()
+            trashed_source = simulated_trash / source.name
+            os.rename(source, trashed_source)
+
+            missing_receipt = run_migrator(
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--finder-handoff-verified",
+                check=False,
+            )
+            self.assertEqual(missing_receipt.returncode, 2)
+            self.assertIn("Exact recovery path is required", missing_receipt.stderr)
+
+            wrong_recovery = root / "Not-The-Source"
+            write_file(wrong_recovery / "content.bin", b"different tree")
+            mismatch = run_migrator(
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(wrong_recovery),
+                "--finder-handoff-verified",
+                check=False,
+            )
+            self.assertEqual(mismatch.returncode, 2)
+            self.assertIn("does not match the journaled source tree", mismatch.stderr)
+
+            dry_run = run_migrator(
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(trashed_source),
+                "--finder-handoff-verified",
+            )
+            self.assertIn("does not empty Trash", dry_run.stdout)
+            self.assertFalse(os.path.lexists(source))
+
+            run_migrator(
+                "link",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--recovery-path",
+                str(trashed_source),
+                "--finder-handoff-verified",
+                "--execute",
+            )
+            self.assertTrue(source.is_symlink())
+            self.assertEqual(source.resolve(), destination.resolve())
+            self.assertEqual((trashed_source / "content.bin").read_bytes(), b"recoverable source")
+            linked_state = json.loads(
+                (destination.parent / f".{destination.name}.migrate-macos-app-data.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                linked_state["handoff_receipt"]["recovery_path"], str(trashed_source)
+            )
 
     def test_dry_run_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-dry-") as temporary:
@@ -437,6 +879,13 @@ class MigrationTests(unittest.TestCase):
             )
 
             run_migrator(*copy_arguments(source, destination), "--execute")
+
+            # Simulate an interruption after the destination symlink was created
+            # but before its extended attributes and ACL were applied.
+            (destination / "payload-link").unlink()
+            os.symlink("payload.bin", destination / "payload-link")
+            run_migrator(*copy_arguments(source, destination), "--execute")
+
             verified = run_migrator(
                 "verify", "--source", str(source), "--destination", str(destination)
             )
@@ -473,6 +922,180 @@ class MigrationTests(unittest.TestCase):
             )
             self.assertEqual(refused.returncode, 2)
             self.assertIn("Metadata differs", refused.stderr)
+
+    def test_verification_ignores_instance_xattrs_only_on_app_root(self) -> None:
+        path = Path("/tmp/example.app")
+        finder_comment = b"com.apple.metadata:kMDItemFinderComment"
+        macl = b"com.apple.macl"
+        provenance = b"com.apple.provenance"
+        quarantine = b"com.apple.quarantine"
+        application_metadata = b"com.example.application-metadata"
+        all_names = [finder_comment, macl, provenance, quarantine, application_metadata]
+        with mock.patch.object(
+            MIGRATOR_MODULE,
+            "list_xattr_names",
+            return_value=all_names,
+        ), mock.patch.object(
+            MIGRATOR_MODULE,
+            "read_xattr",
+            return_value=b"preserved-value",
+        ):
+            data_result = MIGRATOR_MODULE.xattr_map(
+                path,
+                follow_symlinks=False,
+                ignored_names=MIGRATOR_MODULE.verification_ignored_xattrs("data", "."),
+            )
+            app_root_result = MIGRATOR_MODULE.xattr_map(
+                path,
+                follow_symlinks=False,
+                ignored_names=MIGRATOR_MODULE.verification_ignored_xattrs("app", "."),
+            )
+            app_child_result = MIGRATOR_MODULE.xattr_map(
+                path,
+                follow_symlinks=False,
+                ignored_names=MIGRATOR_MODULE.verification_ignored_xattrs("app", "Contents/MacOS/App"),
+            )
+
+        self.assertEqual(
+            app_root_result,
+            {
+                application_metadata.hex(): hashlib.sha256(
+                    b"preserved-value"
+                ).hexdigest()
+            },
+        )
+        self.assertEqual(set(data_result), {name.hex() for name in all_names})
+        self.assertEqual(set(app_child_result), {name.hex() for name in all_names})
+
+    def test_full_verify_limits_rewritten_instance_xattrs_to_app_root(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-root-xattr-") as temporary:
+            root = Path(temporary)
+            source = root / "Source.app"
+            destination = root / "Destination.app"
+            write_file(source / "Contents" / "Info.plist", b"identical app payload")
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+
+            write_xattr(source, "com.apple.quarantine", b"source-instance")
+            write_xattr(destination, "com.apple.quarantine", b"destination-instance")
+            MIGRATOR_MODULE.full_verify(source, destination, kind="app")
+
+            write_xattr(
+                source / "Contents" / "Info.plist",
+                "com.apple.quarantine",
+                b"source-payload-metadata",
+            )
+            write_xattr(
+                destination / "Contents" / "Info.plist",
+                "com.apple.quarantine",
+                b"destination-payload-metadata",
+            )
+            with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Metadata differs"):
+                MIGRATOR_MODULE.full_verify(source, destination, kind="app")
+
+    def test_full_verify_allows_root_provenance_instance_difference(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-root-provenance-") as temporary:
+            root = Path(temporary)
+            source = root / "Source.app"
+            destination = root / "Destination.app"
+            write_file(source / "Contents" / "Info.plist", b"identical app payload")
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+            write_xattr(source, "com.apple.provenance", b"source-root-instance")
+            write_xattr(destination, "com.apple.provenance", b"destination-root-instance")
+
+            MIGRATOR_MODULE.full_verify(source, destination, kind="app")
+
+    def test_full_verify_scopes_destination_only_app_provenance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-provenance-") as temporary:
+            root = Path(temporary)
+            source = root / "Source.app"
+            destination = root / "Destination.app"
+            source_child = source / "Contents" / "Info.plist"
+            destination_child = destination / "Contents" / "Info.plist"
+            write_file(source_child, b"identical app payload")
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+            provenance = b"com.apple.provenance"
+
+            def destination_only_names(path: Path, _follow_symlinks: bool) -> list[bytes]:
+                return [provenance] if Path(path) == destination_child else []
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "list_xattr_names",
+                side_effect=destination_only_names,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "read_xattr",
+                return_value=b"destination-system-instance",
+            ):
+                MIGRATOR_MODULE.full_verify(source, destination, kind="app")
+
+            def source_and_destination_names(
+                path: Path,
+                _follow_symlinks: bool,
+            ) -> list[bytes]:
+                return [provenance] if Path(path) in {source_child, destination_child} else []
+
+            def different_values(path: Path, _name: bytes, _follow_symlinks: bool) -> bytes:
+                return b"source-value" if Path(path) == source_child else b"destination-value"
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "list_xattr_names",
+                side_effect=source_and_destination_names,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "read_xattr",
+                side_effect=different_values,
+            ):
+                with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Metadata differs"):
+                    MIGRATOR_MODULE.full_verify(source, destination, kind="app")
+
+    def test_normalize_allows_only_extra_destination_app_provenance(self) -> None:
+        provenance_key = b"com.apple.provenance".hex()
+
+        source_record = {"xattrs": {}}
+        destination_snapshot = {
+            "xattrs": {provenance_key: "destination-system-instance"}
+        }
+        destination_record = dict(destination_snapshot)
+        destination_record["xattrs"] = dict(destination_record["xattrs"])
+        MIGRATOR_MODULE.normalize_destination_only_app_xattrs(
+            source_record,
+            destination_record,
+            "app",
+        )
+        self.assertEqual(destination_record["xattrs"], {})
+        self.assertEqual(
+            destination_snapshot["xattrs"],
+            {provenance_key: "destination-system-instance"},
+        )
+
+        destination_data_record = {
+            "xattrs": {provenance_key: "destination-system-instance"}
+        }
+        MIGRATOR_MODULE.normalize_destination_only_app_xattrs(
+            source_record,
+            destination_data_record,
+            "data",
+        )
+        self.assertEqual(
+            destination_data_record["xattrs"],
+            {provenance_key: "destination-system-instance"},
+        )
+
+        source_with_provenance = {"xattrs": {provenance_key: "source-value"}}
+        destination_with_changed_provenance = {
+            "xattrs": {provenance_key: "destination-value"}
+        }
+        MIGRATOR_MODULE.normalize_destination_only_app_xattrs(
+            source_with_provenance,
+            destination_with_changed_provenance,
+            "app",
+        )
+        self.assertNotEqual(
+            source_with_provenance["xattrs"],
+            destination_with_changed_provenance["xattrs"],
+        )
 
     def test_acls_are_copied_and_tampering_blocks_verification(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-acl-") as temporary:
@@ -627,6 +1250,8 @@ class MigrationTests(unittest.TestCase):
                 str(copied_app),
                 "--kind",
                 "app",
+                "--process-name",
+                "NoSuchMigratorProcess",
                 "--execute",
             )
             verified = run_migrator(

@@ -336,15 +336,33 @@ def state_path_for(destination: Path) -> Path:
     return destination.parent / f".{destination.name}{STATE_SUFFIX}"
 
 
+def validated_migration_id(state: Dict[str, Any]) -> str:
+    migration_id = state.get("migration_id")
+    if (
+        not isinstance(migration_id, str)
+        or len(migration_id) != 32
+        or any(character not in "0123456789abcdef" for character in migration_id)
+    ):
+        raise MigrationError("Migration journal ID is invalid / 迁移日志 ID 无效")
+    return migration_id
+
+
 def write_state(path: Path, state: Dict[str, Any]) -> None:
     state["updated_at"] = time.time()
-    migration_id = str(state["migration_id"])
-    temporary = path.parent / f".{path.name}.{migration_id}.tmp"
+    migration_id = validated_migration_id(state)
+    write_nonce = uuid.uuid4().hex
+    temporary = path.parent / f".{path.name}.{migration_id}.{write_nonce}.tmp"
     persistent_state = {
         key: value for key, value in state.items() if not key.startswith("_runtime_")
     }
     encoded = (json.dumps(persistent_state, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(temporary), flags, 0o600)
+    except OSError as error:
+        raise MigrationError(
+            f"Cannot safely create migration journal temporary / 无法安全创建迁移日志临时文件: {temporary}: {error}"
+        ) from error
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(encoded)
@@ -370,7 +388,7 @@ def checkpoint_state(path: Path, state: Dict[str, Any], force: bool = False) -> 
 
 def load_state(destination: Path, required: bool = True) -> Optional[Dict[str, Any]]:
     state_path = state_path_for(destination)
-    if not state_path.is_file():
+    if state_path.is_symlink() or not state_path.is_file():
         if required:
             raise MigrationError(f"Migration journal not found / 未找到迁移日志: {state_path}")
         return None
@@ -380,12 +398,20 @@ def load_state(destination: Path, required: bool = True) -> Optional[Dict[str, A
         raise MigrationError(f"Cannot read migration journal / 无法读取迁移日志: {error}") from error
     if state.get("schema_version") != SCHEMA_VERSION:
         raise MigrationError("Unsupported migration journal version / 不支持的迁移日志版本")
+    validated_migration_id(state)
     return state
 
 
 def validate_state(state: Dict[str, Any], source: Path, destination: Path, kind: Optional[str] = None) -> None:
     if state.get("source") != str(source) or state.get("destination") != str(destination):
         raise MigrationError("Migration journal paths do not match / 迁移日志路径不匹配")
+    state_kind = state.get("kind")
+    if state_kind not in {"app", "data"}:
+        raise MigrationError("Migration journal kind is invalid / 迁移日志类型无效")
+    if source.suffix.lower() == ".app" and state_kind != "app":
+        raise MigrationError("An app bundle cannot use data migration rules / 应用包不能使用数据迁移规则")
+    if source.is_dir() and not source.is_symlink() and detect_source_kind(source) != state_kind:
+        raise MigrationError("Migration kind does not match the source / 迁移类型与源路径不匹配")
     if kind is not None and state.get("kind") != kind:
         raise MigrationError("Migration kind does not match journal / 迁移类型与日志不匹配")
 
@@ -405,12 +431,24 @@ def require_source_directory(source: Path) -> None:
         raise MigrationError(f"Source directory not found / 找不到源目录: {source}")
 
 
-def resolve_kind(source: Path, requested: str) -> str:
-    if requested != "auto":
-        return requested
+def detect_source_kind(source: Path) -> str:
     if source.suffix.lower() == ".app" and (source / "Contents" / "Info.plist").is_file():
         return "app"
     return "data"
+
+
+def resolve_kind(source: Path, requested: str) -> str:
+    detected = detect_source_kind(source)
+    if source.suffix.lower() == ".app" and detected != "app":
+        raise MigrationError(
+            f"Path has an .app suffix but is not a valid app bundle / 路径以 .app 结尾但不是有效应用包: {source}"
+        )
+    if requested != "auto" and requested != detected:
+        raise MigrationError(
+            f"Requested kind {requested} conflicts with detected kind {detected} / "
+            f"请求类型 {requested} 与检测类型 {detected} 冲突"
+        )
+    return detected
 
 
 def process_is_running(name: str) -> bool:
@@ -429,6 +467,33 @@ def require_processes_stopped(names: List[str]) -> None:
         raise MigrationError(
             "Quit these processes before continuing / 请先完全退出这些进程: " + ", ".join(running)
         )
+
+
+def merged_process_names(
+    state: Dict[str, Any], supplied: Optional[List[str]] = None, *, required: bool
+) -> List[str]:
+    """Validate and merge journal/process arguments without treating omission as safety."""
+    saved = state.get("process_names", [])
+    if saved is None:
+        saved = []
+    if not isinstance(saved, list) or any(
+        not isinstance(name, str) or not name for name in saved
+    ):
+        raise MigrationError("Migration journal process list is invalid / 迁移日志进程列表无效")
+
+    requested = [] if supplied is None else supplied
+    if not isinstance(requested, list) or any(
+        not isinstance(name, str) or not name for name in requested
+    ):
+        raise MigrationError("Process name is invalid / 进程名无效")
+
+    process_names = sorted(set(saved) | set(requested))
+    if required and not process_names:
+        raise MigrationError(
+            "At least one --process-name is required; record the app, updater, or helper "
+            "process before continuing / 至少需要一个 --process-name；请先记录应用、更新器或辅助进程"
+        )
+    return process_names
 
 
 class DestinationGuard:
@@ -520,6 +585,7 @@ def make_initial_state(
     source: Path,
     destination: Path,
     kind: str,
+    process_names: List[str],
     source_info: Dict[str, Any],
     destination_info: Dict[str, Any],
     stats: Dict[str, Any],
@@ -531,6 +597,7 @@ def make_initial_state(
         "source": str(source),
         "destination": str(destination),
         "kind": kind,
+        "process_names": sorted(set(process_names)),
         "status": "copying",
         "created_at": time.time(),
         "updated_at": time.time(),
@@ -951,9 +1018,11 @@ def copy_tree(
                 else:
                     guard.check()
                     os.symlink(target, str(destination_path))
-                    copy_symlink_metadata(source_path, destination_path)
                     state["progress"]["symlinks"] += 1
-                    checkpoint_state(state_path, state)
+                # A previous run can stop after creating the link but before
+                # applying its metadata. Always reapply metadata on resume.
+                copy_symlink_metadata(source_path, destination_path)
+                checkpoint_state(state_path, state)
             elif expected["type"] == "file":
                 copy_regular_file(
                     relative,
@@ -1022,11 +1091,16 @@ def command_copy(arguments: argparse.Namespace) -> None:
             source,
             destination,
             kind,
+            arguments.process_name,
             disk_info(source),
             destination_info,
             stats,
             snapshot,
         )
+
+    process_names = merged_process_names(state, arguments.process_name, required=True)
+    state["process_names"] = process_names
+    require_processes_stopped(process_names)
 
     existing_payload = 0
     if destination.is_dir() and not destination.is_symlink():
@@ -1043,7 +1117,7 @@ def command_copy(arguments: argparse.Namespace) -> None:
         print("Re-run with --execute after reviewing the exact paths / 审核准确路径后添加 --execute")
         return
 
-    guard = DestinationGuard(destination.parent, destination_info, arguments.process_name)
+    guard = DestinationGuard(destination.parent, destination_info, process_names)
     if existing_state is None:
         write_state(state_path_for(destination), state)
     copy_tree(source, destination, state, guard)
@@ -1059,21 +1133,78 @@ def command_copy(arguments: argparse.Namespace) -> None:
     print("Next: run verify before Finder handoff / 下一步：先运行 verify，再进入访达交接")
 
 
-def xattr_map(path: Path, follow_symlinks: bool) -> Dict[str, str]:
+APP_ROOT_INSTANCE_LOCAL_XATTRS = frozenset(
+    {
+        # macOS can attach or rewrite these system-managed attributes during a
+        # cross-volume app copy or first launch. Finder comments are an
+        # intentional instance label. These rewrite exceptions are deliberately
+        # limited to the app-bundle root. App descendants retain strict xattr
+        # comparison except for the destination-only provenance case documented
+        # separately below; data migrations remain fully strict.
+        b"com.apple.macl",
+        b"com.apple.metadata:kMDItemFinderComment",
+        b"com.apple.provenance",
+        b"com.apple.quarantine",
+    }
+)
+
+# macOS may attach this protected, system-generated attribute to every entry
+# created while copying an application bundle to another volume. It cannot be
+# removed reliably by an unprivileged process. Verification may therefore
+# accept it only when it is an extra destination attribute in an app bundle.
+# A source value must still be preserved exactly, and data migrations retain
+# strict bidirectional xattr comparison.
+APP_DESTINATION_ONLY_XATTRS = frozenset({b"com.apple.provenance"})
+
+
+def verification_ignored_xattrs(kind: str, relative: str) -> frozenset[bytes]:
+    if kind == "app" and relative == ".":
+        return APP_ROOT_INSTANCE_LOCAL_XATTRS
+    return frozenset()
+
+
+def normalize_destination_only_app_xattrs(
+    source_record: Dict[str, Any],
+    destination_record: Dict[str, Any],
+    kind: str,
+) -> None:
+    if kind != "app":
+        return
+    source_xattrs = source_record.get("xattrs")
+    destination_xattrs = destination_record.get("xattrs")
+    if not isinstance(source_xattrs, dict) or not isinstance(destination_xattrs, dict):
+        return
+    for name in APP_DESTINATION_ONLY_XATTRS:
+        key = name.hex()
+        if key not in source_xattrs:
+            destination_xattrs.pop(key, None)
+
+
+def xattr_map(
+    path: Path,
+    follow_symlinks: bool,
+    ignored_names: frozenset[bytes] = frozenset(),
+) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for name in list_xattr_names(path, follow_symlinks):
+        if name in ignored_names:
+            continue
         value = read_xattr(path, name, follow_symlinks)
         result[name.hex()] = hashlib.sha256(value).hexdigest()
     return result
 
 
-def verification_record(path: Path, metadata: os.stat_result) -> Dict[str, Any]:
+def verification_record(
+    path: Path,
+    metadata: os.stat_result,
+    ignored_xattrs: frozenset[bytes] = frozenset(),
+) -> Dict[str, Any]:
     kind = file_type(metadata.st_mode)
     record: Dict[str, Any] = {
         "type": kind,
         "mode": stat.S_IMODE(metadata.st_mode),
         "flags": getattr(metadata, "st_flags", 0),
-        "xattrs": xattr_map(path, follow_symlinks=False),
+        "xattrs": xattr_map(path, follow_symlinks=False, ignored_names=ignored_xattrs),
         "acl": acl_text(path),
     }
     if kind != "symlink":
@@ -1085,44 +1216,142 @@ def verification_record(path: Path, metadata: os.stat_result) -> Dict[str, Any]:
     return record
 
 
-def full_verify(source: Path, destination: Path) -> Dict[str, str]:
-    source_entries = {relative: (path, metadata) for relative, path, metadata in iter_tree(source)}
-    destination_entries = {
-        relative: (path, metadata) for relative, path, metadata in iter_tree(destination)
-    }
+def stability_signature(metadata: os.stat_result) -> Dict[str, Any]:
+    signature = metadata_signature(metadata)
+    signature["ctime_ns"] = metadata.st_ctime_ns
+    return signature
+
+
+def collect_verification_entries(root: Path) -> Dict[str, Tuple[Path, os.stat_result]]:
+    try:
+        return {relative: (path, metadata) for relative, path, metadata in iter_tree(root)}
+    except OSError as error:
+        raise MigrationError(
+            f"Tree changed while being inspected / 检查时目录树发生变化: {root}: {error}"
+        ) from error
+
+
+def verification_stability_snapshot(
+    entries: Dict[str, Tuple[Path, os.stat_result]],
+    kind: str,
+) -> Dict[str, Dict[str, Any]]:
+    snapshot: Dict[str, Dict[str, Any]] = {}
+    for relative in sorted(entries):
+        path, discovered_metadata = entries[relative]
+        try:
+            before = path.lstat()
+            before_signature = stability_signature(before)
+            if before_signature != stability_signature(discovered_metadata):
+                raise MigrationError(
+                    f"Tree changed while being inspected / 检查时目录树发生变化: {relative}"
+                )
+            record = verification_record(
+                path,
+                before,
+                ignored_xattrs=verification_ignored_xattrs(kind, relative),
+            )
+            after_signature = stability_signature(path.lstat())
+        except OSError as error:
+            raise MigrationError(
+                f"Tree changed while being inspected / 检查时目录树发生变化: {relative}: {error}"
+            ) from error
+        if after_signature != before_signature:
+            raise MigrationError(
+                f"Entry changed while metadata was read / 读取元数据时条目发生变化: {relative}"
+            )
+        record["_stability_stat"] = before_signature
+        snapshot[relative] = record
+    return snapshot
+
+
+def stable_sha256_file(path: Path, expected: Dict[str, Any], relative: str) -> str:
+    try:
+        before = stability_signature(path.lstat())
+        if before != expected:
+            raise MigrationError(
+                f"File changed before hashing / 哈希前文件发生变化: {relative}"
+            )
+        digest = sha256_file(path)
+        after = stability_signature(path.lstat())
+    except OSError as error:
+        raise MigrationError(
+            f"File changed while hashing / 哈希时文件发生变化: {relative}: {error}"
+        ) from error
+    if after != before:
+        raise MigrationError(f"File changed while hashing / 哈希时文件发生变化: {relative}")
+    return digest
+
+
+def hardlink_topology(
+    entries: Dict[str, Tuple[Path, os.stat_result]],
+    require_destination_isolation: bool,
+) -> List[Tuple[str, ...]]:
+    inode_groups: Dict[Tuple[int, int], List[str]] = {}
+    for relative, (_path, metadata) in entries.items():
+        if stat.S_ISREG(metadata.st_mode):
+            inode_groups.setdefault((metadata.st_dev, metadata.st_ino), []).append(relative)
+
+    topology: List[Tuple[str, ...]] = []
+    for relatives in inode_groups.values():
+        ordered = tuple(sorted(relatives))
+        if require_destination_isolation:
+            for relative in ordered:
+                metadata = entries[relative][1]
+                if metadata.st_nlink != len(ordered):
+                    raise MigrationError(
+                        "Destination file has a hardlink outside the migration tree / "
+                        f"目标文件在迁移目录树外还有硬链接: {relative}"
+                    )
+        if len(ordered) > 1:
+            topology.append(ordered)
+    return sorted(topology)
+
+
+def full_verify(source: Path, destination: Path, kind: str = "data") -> Dict[str, str]:
+    if kind not in {"app", "data"}:
+        raise MigrationError(f"Invalid verification kind / 无效校验类型: {kind}")
+    source_entries = collect_verification_entries(source)
+    destination_entries = collect_verification_entries(destination)
     if set(source_entries) != set(destination_entries):
         missing = sorted(set(source_entries) - set(destination_entries))[:10]
         extra = sorted(set(destination_entries) - set(source_entries))[:10]
         raise MigrationError(f"Tree entries differ / 目录条目不一致; missing={missing}, extra={extra}")
 
+    source_before = verification_stability_snapshot(source_entries, kind)
+    destination_before = verification_stability_snapshot(destination_entries, kind)
+    source_topology = hardlink_topology(source_entries, require_destination_isolation=False)
+    destination_topology = hardlink_topology(destination_entries, require_destination_isolation=True)
+    if source_topology != destination_topology:
+        raise MigrationError(
+            f"Hardlink topology differs / 硬链接结构不一致: source={source_topology}, destination={destination_topology}"
+        )
+
     hashes: Dict[str, str] = {}
-    source_hardlinks: Dict[Tuple[int, int], List[str]] = {}
     for relative in sorted(source_entries):
-        source_path, source_metadata = source_entries[relative]
-        destination_path, destination_metadata = destination_entries[relative]
-        source_record = verification_record(source_path, source_metadata)
-        destination_record = verification_record(destination_path, destination_metadata)
+        source_path, _source_metadata = source_entries[relative]
+        destination_path, _destination_metadata = destination_entries[relative]
+        source_record = dict(source_before[relative])
+        destination_record = dict(destination_before[relative])
+        source_expected = source_record.pop("_stability_stat")
+        destination_expected = destination_record.pop("_stability_stat")
+        source_record["xattrs"] = dict(source_record["xattrs"])
+        destination_record["xattrs"] = dict(destination_record["xattrs"])
+        normalize_destination_only_app_xattrs(source_record, destination_record, kind)
         if source_record != destination_record:
             raise MigrationError(f"Metadata differs / 元数据不一致: {relative}")
         if source_record["type"] == "file":
-            source_hash = sha256_file(source_path)
-            destination_hash = sha256_file(destination_path)
+            source_hash = stable_sha256_file(source_path, source_expected, relative)
+            destination_hash = stable_sha256_file(destination_path, destination_expected, relative)
             if source_hash != destination_hash:
                 raise MigrationError(f"SHA-256 mismatch / SHA-256 不一致: {relative}")
             hashes[relative] = source_hash
-            if source_metadata.st_nlink > 1:
-                source_hardlinks.setdefault(
-                    (source_metadata.st_dev, source_metadata.st_ino), []
-                ).append(relative)
 
-    for relatives in source_hardlinks.values():
-        destination_inodes = {
-            destination_entries[relative][1].st_ino for relative in relatives
-        }
-        if len(destination_inodes) != 1:
-            raise MigrationError(
-                "Hardlink topology differs / 硬链接结构不一致: " + ", ".join(relatives)
-            )
+    source_after = verification_stability_snapshot(collect_verification_entries(source), kind)
+    destination_after = verification_stability_snapshot(collect_verification_entries(destination), kind)
+    if source_after != source_before:
+        raise MigrationError("Source changed during verification / 校验期间源目录发生变化")
+    if destination_after != destination_before:
+        raise MigrationError("Destination changed during verification / 校验期间目标目录发生变化")
     return hashes
 
 
@@ -1154,10 +1383,19 @@ def command_verify(arguments: argparse.Namespace) -> None:
     require_journal_destination(destination, state)
     if state.get("status") not in {"copied", "verified", "linked"}:
         raise MigrationError("Copy has not completed / 复制尚未完成")
+    process_names = merged_process_names(
+        state, getattr(arguments, "process_name", None), required=True
+    )
+    state["process_names"] = process_names
+    require_processes_stopped(process_names)
 
-    hashes = full_verify(source, destination)
+    hashes = full_verify(source, destination, str(state["kind"]))
     if state.get("kind") == "app":
         verify_app_signature(destination)
+    # A long full-tree hash can outlive an application restart. Do not commit
+    # the verified state while a recorded app, updater, or helper is running,
+    # even when it has not yet changed a migrated file.
+    require_processes_stopped(process_names)
     state["file_sha256"] = hashes
     state["status"] = "linked" if state.get("status") == "linked" else "verified"
     state["verified_at"] = time.time()
@@ -1167,6 +1405,8 @@ def command_verify(arguments: argparse.Namespace) -> None:
         "xattrs": True,
         "acls": True,
         "hardlinks": True,
+        "stable_snapshots": True,
+        "destination_hardlink_isolation": True,
         "codesign": state.get("kind") == "app",
     }
     write_state(state_path_for(destination), state)
@@ -1188,6 +1428,69 @@ def validate_reveal_path(source: Path, requested: Optional[str]) -> Path:
     return candidate
 
 
+def validate_recovery_receipt(
+    source: Path,
+    destination: Path,
+    state: Dict[str, Any],
+    recovery_path: Path,
+) -> Dict[str, Any]:
+    """Prove that the supplied Finder recovery path is the journaled source tree."""
+    if recovery_path == source or recovery_path == destination or is_within(recovery_path, destination):
+        raise MigrationError(
+            "Recovery path must be separate from source and destination / "
+            "恢复路径必须独立于源路径和目标路径"
+        )
+    if recovery_path.is_symlink() or not recovery_path.is_dir():
+        raise MigrationError(
+            f"Recovery path is not a real directory / 恢复路径不是实体目录: {recovery_path}"
+        )
+
+    expected_snapshot = state.get("source_snapshot")
+    if not isinstance(expected_snapshot, dict) or "." not in expected_snapshot:
+        raise MigrationError(
+            "Migration journal has no source snapshot for handoff proof / "
+            "迁移日志没有可用于交接证明的源快照"
+        )
+    try:
+        actual_snapshot = source_snapshot(recovery_path)
+    except OSError as error:
+        raise MigrationError(
+            f"Cannot inspect recovery path / 无法检查恢复路径: {recovery_path}: {error}"
+        ) from error
+    if actual_snapshot != expected_snapshot:
+        raise MigrationError(
+            "Recovery path does not match the journaled source tree / "
+            "恢复路径与日志中的源目录树不一致"
+        )
+
+    root_record = actual_snapshot["."]
+    return {
+        "recovery_path": str(recovery_path),
+        "device": root_record.get("device"),
+        "inode": root_record.get("inode"),
+        "snapshot_matches": True,
+        "verified_at": time.time(),
+    }
+
+
+def require_saved_handoff_receipt(
+    source: Path, destination: Path, state: Dict[str, Any]
+) -> Dict[str, Any]:
+    receipt = state.get("handoff_receipt")
+    if not isinstance(receipt, dict) or not isinstance(receipt.get("recovery_path"), str):
+        raise MigrationError(
+            "Migration journal has no Finder handoff receipt; repeat link with --recovery-path "
+            "and --finder-handoff-verified / 迁移日志没有访达交接收据；请使用 --recovery-path 和 "
+            "--finder-handoff-verified 重新执行 link"
+        )
+    return validate_recovery_receipt(
+        source,
+        destination,
+        state,
+        lexical_absolute(receipt["recovery_path"]),
+    )
+
+
 def command_reveal(arguments: argparse.Namespace) -> None:
     source = lexical_absolute(arguments.source)
     destination = lexical_absolute(arguments.destination)
@@ -1198,6 +1501,8 @@ def command_reveal(arguments: argparse.Namespace) -> None:
     if destination.is_symlink() or not destination.is_dir():
         raise MigrationError("Verified destination is unavailable / 已校验目标不可用")
     require_journal_destination(destination, state)
+    process_names = merged_process_names(state, required=True)
+    require_processes_stopped(process_names)
     if state.get("status") not in {"verified", "linked"}:
         raise MigrationError("Full verification is required first / 必须先完成完整校验")
     reveal_path = validate_reveal_path(source, arguments.path)
@@ -1209,10 +1514,12 @@ def command_reveal(arguments: argparse.Namespace) -> None:
         print("First launch and smoke-test the external app. Then move the internal app to Trash in Finder.")
         print("请先启动并实测外接盘应用；确认正常后，再在访达中把内置应用移到废纸篓。")
     else:
-        print(f"In Finder, rename the source to: {source.name}.internal-backup")
-        print(f"请在访达中把源目录重命名为：{source.name}.internal-backup")
-        print("Return here only after Finder finishes. The tool will not delete or rename it.")
-        print("访达完成后再返回；本工具不会删除或重命名该目录。")
+        print("After explicit authorization, move the source to Trash in Finder but do not empty Trash.")
+        print("用户明确授权后，请在访达中把源目录移到废纸篓，但不要清空废纸篓。")
+        print(f"Use a sibling backup only when explicitly selected: {source.name}.internal-backup")
+        print(f"只有明确选择同级备份时才改名为：{source.name}.internal-backup")
+        print("Return only after Finder finishes. The helper itself will not move or delete the source.")
+        print("访达完成后再继续；迁移脚本本身不会移动或删除源目录。")
     if not arguments.print_only:
         subprocess.run(["/usr/bin/open", "-R", str(reveal_path)], check=True)
 
@@ -1231,9 +1538,13 @@ def command_link(arguments: argparse.Namespace) -> None:
     if not destination.is_dir() or destination.is_symlink():
         raise MigrationError("Verified destination is unavailable / 已校验目标不可用")
     require_journal_destination(destination, state)
+    process_names = merged_process_names(state, required=True)
+    require_processes_stopped(process_names)
 
     if source.is_symlink():
         if source.resolve(strict=False) == destination.resolve(strict=True):
+            require_saved_handoff_receipt(source, destination, state)
+            require_processes_stopped(process_names)
             state["status"] = "linked"
             write_state(state_path_for(destination), state)
             print("Source link already points to destination / 原路径软链接已指向目标")
@@ -1241,8 +1552,10 @@ def command_link(arguments: argparse.Namespace) -> None:
         raise MigrationError("A different source symlink already exists / 原路径已有其他软链接")
     if lexists(source):
         raise MigrationError(
-            "Source still exists. Rename it manually in Finder first; this tool will not remove it / "
-            "源路径仍存在；请先在访达中手动重命名，本工具不会移除它"
+            "Source still exists. Complete the authorized Finder handoff first: move it to Trash by default, "
+            "or use the explicitly selected sibling backup; this tool will not remove it / "
+            "源路径仍存在；请先完成已授权的访达交接：默认移到废纸篓，或使用明确选择的同级备份；"
+            "本工具不会移除源路径"
         )
     if not source.parent.is_dir() or source.parent.is_symlink():
         raise MigrationError("Source parent is unavailable / 源路径上级目录不可用")
@@ -1250,17 +1563,35 @@ def command_link(arguments: argparse.Namespace) -> None:
         raise MigrationError(
             "Source parent is not user-writable; do not use sudo / 当前用户不可写入源路径上级目录，请勿使用 sudo"
         )
+    if not getattr(arguments, "finder_handoff_verified", False):
+        raise MigrationError(
+            "Explicit Finder handoff attestation is required; confirm that the source is in "
+            "Finder Trash or the explicitly selected sibling backup / 必须明确确认已完成访达交接；"
+            "请确认源已在访达废纸篓或明确选择的同级备份中"
+        )
+    recovery_argument = getattr(arguments, "recovery_path", None)
+    if not recovery_argument:
+        raise MigrationError(
+            "Exact recovery path is required for handoff proof / 必须提供准确恢复路径以证明交接可回滚"
+        )
+    recovery_path = lexical_absolute(recovery_argument)
+    handoff_receipt = validate_recovery_receipt(source, destination, state, recovery_path)
 
     print(f"Link / 链接: {source} -> {destination}")
-    print("This creates only a small symlink; it does not delete the Finder backup / 仅建立小型软链接，不删除访达备份")
+    print(f"Recovery receipt / 恢复收据: {recovery_path}")
+    print("This creates only a small symlink; it does not empty Trash or delete the Finder recovery copy / 仅建立小型软链接，不清空废纸篓或删除访达恢复副本")
     if not arguments.execute:
         print("Dry run only / 仅预演；审核后添加 --execute")
         return
+    # Recovery validation can take long enough for an app or helper to restart.
+    # Recheck immediately before publishing the original-path integration link.
+    require_processes_stopped(process_names)
     os.symlink(str(destination), str(source))
     state["status"] = "linked"
     state["linked_at"] = time.time()
+    state["handoff_receipt"] = handoff_receipt
     write_state(state_path_for(destination), state)
-    print("Link created. Keep the Finder backup until the app passes a real smoke test / 链接已建立；应用实测通过前请保留访达备份")
+    print("Link created. Keep the Finder recovery copy until the app passes a real smoke test / 链接已建立；应用实测通过前请保留访达恢复副本")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1286,6 +1617,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify", help="full source-to-destination verification / 完整源目标校验")
     verify.add_argument("--source", required=True)
     verify.add_argument("--destination", required=True)
+    verify.add_argument("--process-name", action="append", default=[])
     verify.set_defaults(handler=command_verify)
 
     reveal = subparsers.add_parser("reveal", help="reveal source or backup in Finder / 在访达定位源或备份")
@@ -1295,9 +1627,18 @@ def build_parser() -> argparse.ArgumentParser:
     reveal.add_argument("--print-only", action="store_true")
     reveal.set_defaults(handler=command_reveal)
 
-    link = subparsers.add_parser("link", help="create a symlink after manual Finder rename / 访达手动重命名后建立软链接")
+    link = subparsers.add_parser("link", help="create a symlink after Finder handoff / 访达交接后建立软链接")
     link.add_argument("--source", required=True)
     link.add_argument("--destination", required=True)
+    link.add_argument(
+        "--recovery-path",
+        help="exact path of the Finder Trash or sibling-backup recovery copy / 访达废纸篓或同级备份中的准确恢复路径",
+    )
+    link.add_argument(
+        "--finder-handoff-verified",
+        action="store_true",
+        help="attest that Finder completed the authorized handoff / 明确确认访达已完成授权交接",
+    )
     link.add_argument("--execute", action="store_true")
     link.set_defaults(handler=command_link)
     return parser
