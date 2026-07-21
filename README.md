@@ -16,7 +16,7 @@ A bilingual Codex Skill for migrating one precisely scoped macOS application or 
 
 - 复制与校验阶段把内置源程序和源数据视为只读；迁移器没有源删除、源移动或自动恢复命令，后续交接只通过访达完成。
 - 迁移日志、临时副本、Swift 构建目录和缓存全部位于目标外接盘。
-- 每个普通文件都做 SHA-256，完整校验还比较目录树、权限、ACL、扩展属性、resource fork、软链接和硬链接；只有 `.app` 根目录上明确记录的 macOS 实例属性允许不同，普通数据与应用内部负载仍严格比较。
+- 每个普通文件都做 SHA-256，完整校验还比较目录树、权限、ACL、扩展属性、resource fork、软链接和硬链接。`.app` 根目录上明确记录的 macOS 实例属性允许不同；macOS 仅在目标 `.app` 任一条目新增的受保护 `com.apple.provenance` 也允许存在，但源端已有的同名属性仍须完全一致。普通数据与其他所有 xattr 仍严格比较。
 - `.app` 额外执行严格深层代码签名校验。
 - 删除内置 `.app` 时，工具只在访达中定位并由用户亲自移到废纸篓。数据目录默认在用户明确授权后，由 Codex 通过访达移到废纸篓但不清空；用户明确偏好时才改用同级 `.internal-backup`。
 - 不请求管理员密码、不使用 `sudo`，不用终端命令删除内置程序或数据。
@@ -102,7 +102,7 @@ read-only audit → external-only copy → full source/destination verification 
 
 - The internal source app/data remains read-only during copy and verification. The migrator has no source-delete, source-move, or automatic-restore command; the later handoff occurs only through Finder.
 - Journals, partial copies, Swift build directories, and caches stay on the target external volume.
-- Every regular file is SHA-256 checked; full verification also compares the tree, permissions, ACLs, extended attributes, resource forks, symlinks, and hardlinks. Only explicitly documented macOS instance attributes on the `.app` root may differ; ordinary data and app descendants remain strict.
+- Every regular file is SHA-256 checked; full verification also compares the tree, permissions, ACLs, extended attributes, resource forks, symlinks, and hardlinks. Explicitly documented macOS instance attributes on the `.app` root may differ. A protected `com.apple.provenance` added by macOS only to the destination may also appear on any app entry, but source-present provenance must match exactly. Data migrations and every other xattr remain strict.
 - An `.app` additionally receives strict deep code-signature verification.
 - For an internal `.app`, the helper only reveals the exact item and the user moves it to Trash. For a data directory, after explicit authorization Codex normally moves the exact source to Trash through Finder without emptying Trash; a sibling `.internal-backup` is used only when the user explicitly prefers it.
 - It never requests an administrator password, uses `sudo`, or deletes internal app/data paths from Terminal.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -316,6 +317,53 @@ class MigrationTests(unittest.TestCase):
                 (source / "a.bin").read_bytes(),
                 (destination / "a.bin").read_bytes(),
             )
+
+    def test_verify_rechecks_processes_before_committing_verified_state(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-verify-process-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = root / "external" / "Data"
+            source.mkdir(parents=True)
+            destination.mkdir(parents=True)
+            state = {
+                "schema_version": MIGRATOR_MODULE.SCHEMA_VERSION,
+                "migration_id": "a" * 32,
+                "source": str(source),
+                "destination": str(destination),
+                "kind": "data",
+                "status": "copied",
+                "process_names": ["ExampleProcess"],
+            }
+            arguments = argparse.Namespace(source=str(source), destination=str(destination))
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "load_state",
+                return_value=state,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "require_journal_destination",
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "process_is_running",
+                side_effect=[False, True],
+            ) as process_is_running, mock.patch.object(
+                MIGRATOR_MODULE,
+                "full_verify",
+                return_value={},
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "write_state",
+            ) as write_state:
+                with self.assertRaisesRegex(
+                    MIGRATOR_MODULE.MigrationError,
+                    "Quit these processes before continuing",
+                ):
+                    MIGRATOR_MODULE.command_verify(arguments)
+
+            self.assertEqual(process_is_running.call_count, 2)
+            self.assertEqual(state["status"], "copied")
+            write_state.assert_not_called()
 
     def test_app_bundle_cannot_be_downgraded_to_data_kind(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-kind-app-") as temporary:
@@ -702,7 +750,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(set(data_result), {name.hex() for name in all_names})
         self.assertEqual(set(app_child_result), {name.hex() for name in all_names})
 
-    def test_full_verify_limits_instance_xattr_exceptions_to_app_root(self) -> None:
+    def test_full_verify_limits_rewritten_instance_xattrs_to_app_root(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-root-xattr-") as temporary:
             root = Path(temporary)
             source = root / "Source.app"
@@ -726,6 +774,52 @@ class MigrationTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Metadata differs"):
                 MIGRATOR_MODULE.full_verify(source, destination, kind="app")
+
+    def test_full_verify_scopes_destination_only_app_provenance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-app-provenance-") as temporary:
+            root = Path(temporary)
+            source = root / "Source.app"
+            destination = root / "Destination.app"
+            source_child = source / "Contents" / "Info.plist"
+            destination_child = destination / "Contents" / "Info.plist"
+            write_file(source_child, b"identical app payload")
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+            provenance = b"com.apple.provenance"
+
+            def destination_only_names(path: Path, _follow_symlinks: bool) -> list[bytes]:
+                return [provenance] if Path(path) == destination_child else []
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "list_xattr_names",
+                side_effect=destination_only_names,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "read_xattr",
+                return_value=b"destination-system-instance",
+            ):
+                MIGRATOR_MODULE.full_verify(source, destination, kind="app")
+
+            def source_and_destination_names(
+                path: Path,
+                _follow_symlinks: bool,
+            ) -> list[bytes]:
+                return [provenance] if Path(path) in {source_child, destination_child} else []
+
+            def different_values(path: Path, _name: bytes, _follow_symlinks: bool) -> bytes:
+                return b"source-value" if Path(path) == source_child else b"destination-value"
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "list_xattr_names",
+                side_effect=source_and_destination_names,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "read_xattr",
+                side_effect=different_values,
+            ):
+                with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Metadata differs"):
+                    MIGRATOR_MODULE.full_verify(source, destination, kind="app")
 
     def test_normalize_allows_only_extra_destination_app_provenance(self) -> None:
         provenance_key = b"com.apple.provenance".hex()

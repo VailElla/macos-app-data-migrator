@@ -1115,9 +1115,10 @@ APP_ROOT_INSTANCE_LOCAL_XATTRS = frozenset(
     {
         # macOS can attach or rewrite these system-managed attributes during a
         # cross-volume app copy or first launch. Finder comments are an
-        # intentional instance label. The exception is deliberately limited
-        # to the app-bundle root; data migrations and app descendants retain
-        # strict payload-xattr comparison.
+        # intentional instance label. These rewrite exceptions are deliberately
+        # limited to the app-bundle root. App descendants retain strict xattr
+        # comparison except for the destination-only provenance case documented
+        # separately below; data migrations remain fully strict.
         b"com.apple.macl",
         b"com.apple.metadata:kMDItemFinderComment",
         b"com.apple.provenance",
@@ -1370,6 +1371,10 @@ def command_verify(arguments: argparse.Namespace) -> None:
     hashes = full_verify(source, destination, str(state["kind"]))
     if state.get("kind") == "app":
         verify_app_signature(destination)
+    # A long full-tree hash can outlive an application restart. Do not commit
+    # the verified state while a recorded app, updater, or helper is running,
+    # even when it has not yet changed a migrated file.
+    require_processes_stopped(process_names)
     state["file_sha256"] = hashes
     state["status"] = "linked" if state.get("status") == "linked" else "verified"
     state["verified_at"] = time.time()

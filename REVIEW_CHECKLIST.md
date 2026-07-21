@@ -16,12 +16,12 @@ This checklist is the GitHub publication gate. The repository owner should revie
 - [ ] CLI 只有 `audit`、`copy`、`verify`、`reveal`、`link`。 / The CLI exposes only `audit`, `copy`, `verify`, `reveal`, and `link`.
 - [ ] 没有 `move`、`restore`、源删除、源覆盖或源重命名能力。 / There is no move, restore, source-delete, source-overwrite, or source-rename capability.
 - [ ] `copy --execute` 的状态、临时文件和工具缓存全部写在目标外接宗卷。 / Copy state, partials, and tool caches stay on the external destination volume.
-- [ ] 目标断开、宗卷 UUID 改变、源树变化或程序重新运行时会安全停止。 / It safely stops on disconnection, UUID change, source-tree change, or process restart.
+- [ ] 目标断开、宗卷 UUID 改变、源树变化或程序重新运行时会安全停止；`verify` 在写入已校验状态前再次复查进程。 / It safely stops on disconnection, UUID change, source-tree change, or process restart; `verify` rechecks processes before committing verified state.
 
 ## 3. 数据完整性 / Data integrity
 
 - [ ] 每个普通文件复制时和完整验证时都比较 SHA-256。 / Every regular file receives SHA-256 comparison during copy and full verification.
-- [ ] 完整验证覆盖目录树、类型、权限、ACL、扩展属性/resource fork、软链接和硬链接；只有 `.app` 根目录上明确记录的实例属性允许不同。 / Full verification covers the tree, types, permissions, ACLs, extended attributes/resource forks, symlinks, and hardlinks; only documented instance attributes on the `.app` root may differ.
+- [ ] 完整验证覆盖目录树、类型、权限、ACL、扩展属性/resource fork、软链接和硬链接；`.app` 根目录的已记录实例属性可不同，目标端任一应用条目新增的受保护 provenance 可存在，但源端已有 provenance 必须完全一致。 / Full verification covers the tree, types, permissions, ACLs, extended attributes/resource forks, symlinks, and hardlinks; documented app-root instance attributes may differ, and destination-only protected provenance may appear on any app entry, but source-present provenance must match exactly.
 - [ ] `.app` 目标执行 `codesign --verify --deep --strict`。 / App destinations receive strict deep signature verification.
 - [ ] 目标已有不同文件时拒绝覆盖。 / A differing pre-existing destination file is never overwritten.
 - [ ] 中断后可使用相同日志与命令续传，源仍保持不变。 / The same journal and command resume an interruption while the source remains unchanged.

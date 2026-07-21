@@ -56,7 +56,7 @@ python3 scripts/migrate_app_data.py verify \
   --destination "/Volumes/External/ExactDestination"
 ```
 
-`verify` 对每个普通文件重新计算源与目标 SHA-256，并比较目录树、类型、权限、ACL、扩展属性、软链接目标和硬链接结构；普通数据与 `.app` 内部负载的 xattr 保持严格比较，只有 `.app` 根目录上明确列出的 macOS 实例属性允许不同。`.app` 还必须通过 `codesign --verify --deep --strict`。校验时源路径必须仍是实体目录，因此不能提前清理内置盘。
+`verify` 对每个普通文件重新计算源与目标 SHA-256，并比较目录树、类型、权限、ACL、扩展属性、软链接目标和硬链接结构；`.app` 根目录上明确列出的 macOS 实例属性允许不同，macOS 仅在目标 `.app` 任一条目新增的受保护 `com.apple.provenance` 也允许存在，但源端已有的同名属性仍须完全一致。普通数据与其他所有 xattr 保持严格比较。`.app` 还必须通过 `codesign --verify --deep --strict`。校验开始前和写入 `verified` 状态前都会复查日志中记录的程序、更新器和辅助进程仍已退出。校验时源路径必须仍是实体目录，因此不能提前清理内置盘。
 
 ### 4A. 程序 `.app` 的访达交接
 
@@ -72,7 +72,7 @@ python3 scripts/migrate_app_data.py reveal \
 
 交接回复必须用文本提供一个直接指向内置 `.app` 的可点击本地文件链接，例如 `[在访达中选择内置 App.app](/Applications/App.app)`；不能只链接 `/Applications` 父目录或只让用户自己寻找。链接目标必须是本轮已核对的精确源路径。若当前客户端不能打开本地文件链接，再以 `reveal` 作为后备定位方式。链接只负责选择目标，仍由用户亲自在访达中移到废纸篓。
 
-为了在访达中区分副本，默认保留真实 `.app` 文件名，避免未经验证的改名影响更新器；在完整校验后给外接副本写入访达备注 `应用名（外接版）`。准确迁移路径仍按真实文件名记录。只有 `.app` 根目录的访达备注及脚本列出的 macOS 实例属性不参与负载元数据比较；普通数据与应用内部条目仍严格比较全部 xattr。
+为了在访达中区分副本，默认保留真实 `.app` 文件名，避免未经验证的改名影响更新器；在完整校验后给外接副本写入访达备注 `应用名（外接版）`。准确迁移路径仍按真实文件名记录。`.app` 根目录的访达备注及脚本列出的 macOS 实例属性不参与负载元数据比较；应用内部条目只允许目标端新增的受保护 `com.apple.provenance` 这一项实例例外，源端已有 provenance 和其他全部 xattr 仍须严格一致。普通数据没有这项例外。
 
 ### 4B. 数据目录的访达交接
 
@@ -127,7 +127,7 @@ The copier SHA-256 checks each file, preserves symlinks, hardlinks, ACLs, extend
 
 ### 3. Fully verify while the source still exists
 
-Run the `verify` command shown above. It re-hashes every regular file and compares the complete tree, entry types, permissions, ACLs, extended attributes, symlink targets, and hardlink topology. Ordinary data and app descendants retain strict xattr comparison; only explicitly listed macOS instance attributes on the `.app` root may differ. An app bundle must also pass strict deep code-signature verification. The source must remain a real directory during this gate.
+Run the `verify` command shown above. It re-hashes every regular file and compares the complete tree, entry types, permissions, ACLs, extended attributes, symlink targets, and hardlink topology. Explicitly listed macOS instance attributes on the `.app` root may differ. A protected `com.apple.provenance` added by macOS only to the destination may also appear on any app entry, but source-present provenance must match exactly; data migrations and every other xattr remain strict. An app bundle must also pass strict deep code-signature verification. The recorded app, updater, and helper processes are checked before verification and again before committing `verified` state. The source must remain a real directory during this gate.
 
 ### 4A. Finder handoff for an `.app`
 
@@ -135,7 +135,7 @@ Launch the verified app directly from the external volume. Test sign-in, existin
 
 The handoff response must provide a clickable local-file link that targets the exact verified internal `.app`, for example `[Select the internal App.app in Finder](/Applications/App.app)`. Do not link only to the `/Applications` parent or make the user locate the bundle manually. Use `reveal` as a fallback when the client cannot open local-file links. The link selects the target; the user still moves it to Trash in Finder.
 
-Keep the real `.app` filename unless updater compatibility with renaming has been proven. After full verification, add the Finder comment `App Name (External)` to identify the external copy while preserving its exact path. Only the Finder comment and listed macOS instance attributes on the `.app` root are excluded from payload-metadata comparison; ordinary data and app descendants retain strict xattr checks.
+Keep the real `.app` filename unless updater compatibility with renaming has been proven. After full verification, add the Finder comment `App Name (External)` to identify the external copy while preserving its exact path. The Finder comment and listed macOS instance attributes on the `.app` root are excluded from payload-metadata comparison. Within app descendants, the only instance exception is destination-only protected `com.apple.provenance`; source-present provenance and every other xattr must still match exactly. Data migrations have no such exception.
 
 ### 4B. Finder handoff for a data directory
 
