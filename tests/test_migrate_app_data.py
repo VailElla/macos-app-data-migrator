@@ -367,6 +367,105 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(state["status"], "copied")
             write_state.assert_not_called()
 
+    def test_reveal_refuses_running_process_before_finder_handoff(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-reveal-process-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = root / "external" / "Data"
+            source.mkdir(parents=True)
+            destination.mkdir(parents=True)
+            state = {
+                "schema_version": MIGRATOR_MODULE.SCHEMA_VERSION,
+                "migration_id": "a" * 32,
+                "source": str(source),
+                "destination": str(destination),
+                "kind": "data",
+                "status": "verified",
+                "process_names": ["ExampleProcess"],
+            }
+            arguments = argparse.Namespace(
+                source=str(source),
+                destination=str(destination),
+                path=None,
+                print_only=True,
+            )
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "load_state",
+                return_value=state,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "require_journal_destination",
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "process_is_running",
+                return_value=True,
+            ) as process_is_running:
+                with self.assertRaisesRegex(
+                    MIGRATOR_MODULE.MigrationError,
+                    "Quit these processes before continuing",
+                ):
+                    MIGRATOR_MODULE.command_reveal(arguments)
+
+            process_is_running.assert_called_once_with("ExampleProcess")
+
+    def test_link_rechecks_processes_after_recovery_validation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-link-process-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = root / "external" / "Data"
+            recovery = root / "Trash" / "Data"
+            write_file(source / "payload.bin", b"recoverable source")
+            destination.mkdir(parents=True)
+            snapshot = MIGRATOR_MODULE.source_snapshot(source)
+            recovery.parent.mkdir()
+            os.rename(source, recovery)
+            state = {
+                "schema_version": MIGRATOR_MODULE.SCHEMA_VERSION,
+                "migration_id": "a" * 32,
+                "source": str(source),
+                "destination": str(destination),
+                "kind": "data",
+                "status": "verified",
+                "process_names": ["ExampleProcess"],
+                "source_snapshot": snapshot,
+            }
+            arguments = argparse.Namespace(
+                source=str(source),
+                destination=str(destination),
+                recovery_path=str(recovery),
+                finder_handoff_verified=True,
+                execute=True,
+            )
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "load_state",
+                return_value=state,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "require_journal_destination",
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "process_is_running",
+                side_effect=[False, True],
+            ) as process_is_running, mock.patch.object(
+                MIGRATOR_MODULE,
+                "write_state",
+            ) as write_state:
+                with self.assertRaisesRegex(
+                    MIGRATOR_MODULE.MigrationError,
+                    "Quit these processes before continuing",
+                ):
+                    MIGRATOR_MODULE.command_link(arguments)
+
+            self.assertEqual(process_is_running.call_count, 2)
+            self.assertFalse(os.path.lexists(source))
+            self.assertEqual((recovery / "payload.bin").read_bytes(), b"recoverable source")
+            self.assertEqual(state["status"], "verified")
+            write_state.assert_not_called()
+
     def test_process_names_are_required_and_legacy_journals_can_be_repaired(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-process-journal-") as temporary:
             root = Path(temporary)

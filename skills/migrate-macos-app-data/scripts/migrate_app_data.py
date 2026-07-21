@@ -1501,7 +1501,8 @@ def command_reveal(arguments: argparse.Namespace) -> None:
     if destination.is_symlink() or not destination.is_dir():
         raise MigrationError("Verified destination is unavailable / 已校验目标不可用")
     require_journal_destination(destination, state)
-    merged_process_names(state, required=True)
+    process_names = merged_process_names(state, required=True)
+    require_processes_stopped(process_names)
     if state.get("status") not in {"verified", "linked"}:
         raise MigrationError("Full verification is required first / 必须先完成完整校验")
     reveal_path = validate_reveal_path(source, arguments.path)
@@ -1537,11 +1538,13 @@ def command_link(arguments: argparse.Namespace) -> None:
     if not destination.is_dir() or destination.is_symlink():
         raise MigrationError("Verified destination is unavailable / 已校验目标不可用")
     require_journal_destination(destination, state)
-    merged_process_names(state, required=True)
+    process_names = merged_process_names(state, required=True)
+    require_processes_stopped(process_names)
 
     if source.is_symlink():
         if source.resolve(strict=False) == destination.resolve(strict=True):
             require_saved_handoff_receipt(source, destination, state)
+            require_processes_stopped(process_names)
             state["status"] = "linked"
             write_state(state_path_for(destination), state)
             print("Source link already points to destination / 原路径软链接已指向目标")
@@ -1580,6 +1583,9 @@ def command_link(arguments: argparse.Namespace) -> None:
     if not arguments.execute:
         print("Dry run only / 仅预演；审核后添加 --execute")
         return
+    # Recovery validation can take long enough for an app or helper to restart.
+    # Recheck immediately before publishing the original-path integration link.
+    require_processes_stopped(process_names)
     os.symlink(str(destination), str(source))
     state["status"] = "linked"
     state["linked_at"] = time.time()
