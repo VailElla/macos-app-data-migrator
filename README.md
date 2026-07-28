@@ -71,6 +71,8 @@ Skill 会先只读审计，再逐步停在每个真实审查门槛。不要从 R
 
 构建必须显式指定外接输出路径；编译缓存和临时目录同样位于该外接宗卷。生成的 `.app` 含本机绝对路径和 ad-hoc 签名，已被忽略，不能提交到 GitHub。
 
+真实 APFS 跨宗卷迁移的故障链、校验证据与回滚状态见[鸣潮 APFS 跨宗卷迁移验收记录](docs/cases/2026-07-29-wuthering-waves-cross-volume-migration.md)。
+
 ### 开发验证
 
 ```bash
@@ -150,6 +152,8 @@ The macOS game is App Sandbox constrained, so a plain symlink does not independe
 
 The builder requires an explicit external output. Its compiler cache and temporary directory stay on that same external volume. A generated `.app` embeds local absolute paths and an ad-hoc signature, is ignored by Git, and must never be published.
 
+See the [real APFS cross-volume migration case](docs/cases/2026-07-29-wuthering-waves-cross-volume-migration.md) for the observed failure chain, verification evidence, and rollback state.
+
 ### Development validation
 
 Run the commands in the Chinese section. The test suite puts destination copies, journals, partials, build directories, and compiler caches on a disposable external APFS RAM volume. Only small source fixtures live in the internal temporary directory, and no live migration is touched. The suite covers source immutability, dry-run behavior, copy resume, full hashing, real xattr/ACL preservation and tamper rejection, hardlinks, symlinks, canonical launcher paths, destination tampering, Finder handoff, launcher build/signing, app-copy signature verification, and the absence of source-deletion or internal-volume-override CLI commands.
@@ -167,6 +171,7 @@ skills/migrate-macos-app-data/
     ├── migrate_app_data.py
     └── build_wuthering_waves_launcher.sh
 tests/
+docs/cases/                    # anonymized real migration records / 匿名化真实迁移记录
 REVIEW_CHECKLIST.md
 ```
 
