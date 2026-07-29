@@ -606,6 +606,42 @@ class MigrationTests(unittest.TestCase):
                 (destination / "first-hardlink.bin").stat().st_ino,
             )
 
+    def test_copy_handles_near_name_max_and_dot_underscore_filenames(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-long-filename-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Long Names"
+            destination = self.external_parent("long-filename") / "Long Names"
+            source.mkdir(parents=True)
+
+            long_name = f"{'x' * 240}.bin"
+            write_file(source / long_name, b"near APFS NAME_MAX")
+            write_file(source / ".__.DS_Store", b"ordinary dot-underscore-prefixed file")
+
+            migration_id = "a" * 32
+            generated_partial = MIGRATOR_MODULE.partial_path(destination / long_name, migration_id)
+            self.assertLessEqual(
+                len(os.fsencode(generated_partial.name)),
+                os.pathconf(str(destination.parent), "PC_NAME_MAX"),
+            )
+            self.assertNotIn(long_name, generated_partial.name)
+
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            verified = run_migrator(
+                "verify",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+            )
+
+            self.assertIn("Full verification passed", verified.stdout)
+            self.assertEqual((destination / long_name).read_bytes(), b"near APFS NAME_MAX")
+            self.assertEqual(
+                (destination / ".__.DS_Store").read_bytes(),
+                b"ordinary dot-underscore-prefixed file",
+            )
+            self.assertFalse(any(path.name.startswith(".migrate-partial.") for path in destination.iterdir()))
+
     def test_finder_handoff_requires_source_path_to_be_free_before_link(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-finder-") as temporary:
             root = Path(temporary)

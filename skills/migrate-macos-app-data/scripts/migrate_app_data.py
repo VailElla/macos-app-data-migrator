@@ -793,13 +793,42 @@ def copy_symlink_metadata(source: Path, destination: Path) -> None:
     copy_acl(source, destination, follow_symlinks=False)
 
 
+def validate_migration_id(migration_id: str) -> None:
+    if len(migration_id) != 32 or any(character not in "0123456789abcdef" for character in migration_id):
+        raise MigrationError(f"Invalid migration identifier / 迁移标识无效: {migration_id!r}")
+
+
 def partial_path(destination_file: Path, migration_id: str) -> Path:
-    return destination_file.parent / f".{destination_file.name}.{migration_id}.partial"
+    """Return a deterministic partial name that stays below APFS NAME_MAX.
+
+    Prefixing the original basename can exceed the usual 255-byte component
+    limit when the source filename is already legal but close to NAME_MAX.
+    The parent directory already scopes the artifact, so a full SHA-256 of the
+    basename gives us a stable, collision-resistant, ASCII-only replacement.
+    """
+    validate_migration_id(migration_id)
+    basename_digest = hashlib.sha256(os.fsencode(destination_file.name)).hexdigest()
+    return destination_file.parent / f".migrate-partial.{migration_id}.{basename_digest}"
 
 
-def prepare_owned_partial(path: Path, destination: Path, migration_id: str) -> None:
-    expected_suffix = f".{migration_id}.partial"
-    if not path.name.endswith(expected_suffix) or not is_within(path, destination):
+def owned_partial_candidates(destination_file: Path, migration_id: str) -> List[Path]:
+    """Return the current partial path plus a safe legacy-resume candidate."""
+    current = partial_path(destination_file, migration_id)
+    legacy_name = f".{destination_file.name}.{migration_id}.partial"
+    name_max = os.pathconf(str(destination_file.parent), "PC_NAME_MAX")
+    candidates = [current]
+    if len(os.fsencode(legacy_name)) <= name_max:
+        candidates.append(destination_file.parent / legacy_name)
+    return candidates
+
+
+def prepare_owned_partial(
+    path: Path,
+    destination_file: Path,
+    destination: Path,
+    migration_id: str,
+) -> None:
+    if path not in owned_partial_candidates(destination_file, migration_id) or not is_within(path, destination):
         raise MigrationError(f"Refusing to rewrite unowned artifact / 拒绝改写非本工具临时文件: {path}")
     if lexists(path):
         if path.is_symlink() or not path.is_file():
@@ -868,6 +897,27 @@ def ditto_copy_file(source: Path, partial: Path, work_root: Path) -> None:
         raise MigrationError(f"ditto failed for {source}: {result.stderr.strip()}")
 
 
+def copy_dot_underscore_file(source: Path, partial: Path) -> None:
+    """Copy an ordinary `._*` file without ditto treating it as AppleDouble."""
+    existed = lexists(partial)
+    flags = os.O_WRONLY | os.O_NOFOLLOW
+    if existed:
+        flags |= os.O_TRUNC
+    else:
+        flags |= os.O_CREAT | os.O_EXCL
+    descriptor = os.open(str(partial), flags, 0o600)
+    try:
+        with source.open("rb") as source_handle, os.fdopen(descriptor, "wb", closefd=False) as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+            target_handle.flush()
+            os.fsync(target_handle.fileno())
+    finally:
+        os.close(descriptor)
+    shutil.copystat(str(source), str(partial), follow_symlinks=False)
+    copy_xattrs(source, partial, follow_symlinks=False)
+    copy_acl(source, partial, follow_symlinks=True)
+
+
 def copy_regular_file(
     relative: str,
     source_file: Path,
@@ -909,12 +959,16 @@ def copy_regular_file(
         state["file_sha256"][relative] = source_hash
     else:
         migration_id = str(state["migration_id"])
-        partial = partial_path(destination_file, migration_id)
+        partial_candidates = owned_partial_candidates(destination_file, migration_id)
+        partial = next((candidate for candidate in partial_candidates if lexists(candidate)), partial_candidates[0])
         if lexists(partial):
-            prepare_owned_partial(partial, destination, migration_id)
+            prepare_owned_partial(partial, destination_file, destination, migration_id)
 
         before = metadata_signature(source_file.lstat())
-        ditto_copy_file(source_file, partial, work_root)
+        if source_file.name.startswith("._"):
+            copy_dot_underscore_file(source_file, partial)
+        else:
+            ditto_copy_file(source_file, partial, work_root)
         if not partial.is_file() or partial.is_symlink():
             raise MigrationError(f"Partial copy is not a regular file / 临时副本不是普通文件: {partial}")
         with partial.open("rb") as handle:

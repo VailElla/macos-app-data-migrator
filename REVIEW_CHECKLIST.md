@@ -25,6 +25,7 @@ This checklist is the GitHub publication gate. The repository owner should revie
 - [ ] `.app` 目标执行 `codesign --verify --deep --strict`。 / App destinations receive strict deep signature verification.
 - [ ] 目标已有不同文件时拒绝覆盖。 / A differing pre-existing destination file is never overwritten.
 - [ ] 中断后可使用相同日志与命令续传，源仍保持不变。 / The same journal and command resume an interruption while the source remains unchanged.
+- [ ] 接近 APFS `NAME_MAX` 的合法源文件名不会因 partial 命名变长而复制失败；普通 `._` 前缀文件不会被当作可忽略旁车。 / A legal source filename near APFS `NAME_MAX` does not fail because the partial name grows, and ordinary `._`-prefixed files are not treated as ignorable sidecars.
 
 ## 4. 内置空间与删除策略 / Internal space and removal policy
 
@@ -58,7 +59,16 @@ This checklist is the GitHub publication gate. The repository owner should revie
 - [ ] 没有提交生成的 `.app`、迁移日志、partial、缓存或 `.DS_Store`。 / No generated app, journal, partial, cache, or `.DS_Store` is committed.
 - [ ] MIT License 和 GitHub Actions 验证流程符合预期。 / The MIT License and GitHub Actions validation workflow are acceptable.
 
-## 8. 本地验证 / Local validation
+## 8. 外接 APFS 容器整合 / External APFS container consolidation
+
+- [ ] 整盘整合是独立的低自由度参考流程；`migrate_app_data.py` 仍不接受宗卷根目录，也没有删除容器子命令。 / Whole-disk consolidation remains a separate low-freedom reference; `migrate_app_data.py` still rejects volume roots and has no container-deletion command.
+- [ ] 每个删除、扩容或改名动作前按容器、宗卷和物理存储 UUID 重新解析动态 `diskN` 标识。 / Dynamic `diskN` identifiers are resolved again from container, volume, and physical-store UUIDs immediately before every delete, resize, or rename.
+- [ ] `Device not configured` 或 USB 重新枚举后停止写入、重新枚举、只读检查并重新建立可信快照，不篡改日志绕过 `st_dev`/inode 身份保护。 / After `Device not configured` or USB re-enumeration, writes stop, identity is re-enumerated, read-only checks run, and a trusted snapshot is rebuilt without patching journals around `st_dev`/inode guards.
+- [ ] `ditto` 后比较完整路径集合，逐个补齐被误判为 AppleDouble 的普通 `._` 文件，并恢复非 provenance xattr 和由深到浅的目录元数据。 / After `ditto`, complete path sets are compared, ordinary `._` files mistaken for AppleDouble are supplemented individually, and non-provenance xattrs plus deepest-first directory metadata are restored.
+- [ ] 受保护 provenance 例外会准确披露并取得用户明确接受，不会削弱普通数据的严格校验。 / Protected provenance exceptions are disclosed exactly and explicitly accepted by the user without weakening strict data verification.
+- [ ] 临时分区被明确标注为同盘暂存而非备份；只有最终行为测试、文件系统检查和完整校验通过后才删除并扩容到磁盘末尾。 / Temporary same-disk staging is explicitly not a backup and is deleted only after final behavior tests, filesystem checks, and full verification pass before resizing to the disk end.
+
+## 9. 本地验证 / Local validation
 
 审查者可在仓库根目录运行： / Reviewers can run from the repository root:
 
@@ -81,7 +91,7 @@ git diff --check
 - [ ] 所有命令通过。 / Every command passes.
 - [ ] 测试的目标副本、日志、partial、构建目录和缓存位于一次性外接 APFS RAM 宗卷；内置临时目录只有小型源夹具，且不接触当前真实鸣潮迁移结果。 / Test destinations, journals, partials, build directories, and caches stay on a disposable external APFS RAM volume; only small source fixtures are internal, and the current real Wuthering Waves migration is untouched.
 
-## 9. 所有者决定 / Owner decision
+## 10. 所有者决定 / Owner decision
 
 - [ ] 我已审查并接受上述安全边界、功能范围、双语文案和 MIT License。 / I reviewed and accept the safety boundary, scope, bilingual wording, and MIT License.
 - [ ] 我明确授权下一步发布到 GitHub。 / I explicitly authorize the next GitHub publication step.

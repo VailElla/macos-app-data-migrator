@@ -28,6 +28,8 @@ class SkillStructureTests(unittest.TestCase):
             "recovery.en.md",
             "wuthering-waves.zh-CN.md",
             "wuthering-waves.en.md",
+            "apfs-container-consolidation.zh-CN.md",
+            "apfs-container-consolidation.en.md",
         )
         for reference in references:
             self.assertTrue((SKILL_ROOT / "references" / reference).is_file(), msg=reference)
@@ -67,6 +69,12 @@ class SkillStructureTests(unittest.TestCase):
         wuthering_zh = (SKILL_ROOT / "references" / "wuthering-waves.zh-CN.md").read_text(
             encoding="utf-8"
         )
+        consolidation_en = (
+            SKILL_ROOT / "references" / "apfs-container-consolidation.en.md"
+        ).read_text(encoding="utf-8")
+        consolidation_zh = (
+            SKILL_ROOT / "references" / "apfs-container-consolidation.zh-CN.md"
+        ).read_text(encoding="utf-8")
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         checklist = (REPO_ROOT / "REVIEW_CHECKLIST.md").read_text(encoding="utf-8")
         builder = (SKILL_ROOT / "scripts" / "build_wuthering_waves_launcher.sh").read_text(
@@ -103,6 +111,18 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("source-present provenance and every other xattr must still match exactly", skill)
         self.assertIn("至少记录一个相关进程", skill)
         self.assertIn("at least one app, updater, or helper process", skill)
+        self.assertIn("外接 APFS 容器整合流程", skill)
+        self.assertIn("External APFS container consolidation workflow", skill)
+        self.assertIn("容器 UUID", consolidation_zh)
+        self.assertIn("container UUID", consolidation_en)
+        self.assertIn("Device not configured", consolidation_zh)
+        self.assertIn("Device not configured", consolidation_en)
+        self.assertIn("`._`", consolidation_zh)
+        self.assertIn("`._`", consolidation_en)
+        self.assertIn("明确接受", consolidation_zh)
+        self.assertIn("explicit user acceptance", consolidation_en)
+        self.assertIn("resizeContainer", consolidation_zh)
+        self.assertIn("resizeContainer", consolidation_en)
         self.assertIn("写入 `verified` 状态前", skill)
         self.assertIn("before committing `verified` state", skill)
         self.assertIn("应用内部条目只允许目标端新增的受保护 provenance", checklist)
