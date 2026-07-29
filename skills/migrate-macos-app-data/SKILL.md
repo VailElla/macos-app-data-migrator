@@ -1,6 +1,6 @@
 ---
 name: migrate-macos-app-data
-description: Safely copy, verify, and hand off a macOS application bundle or one narrowly scoped application-data directory to an external APFS volume without writing migration payloads or temporary files to the nearly-full internal disk and without deleting source data in Terminal; use for macOS apps, games, media libraries, models, downloads, or Wuthering Waves / 鸣潮 when the user needs Finder-guided removal and a proven native setting, symlink, or security-scoped adapter. 安全地把 macOS 程序或单个明确的数据目录复制、完整校验并交接到外接 APFS 宗卷；适用于内置盘接近无可用空间、禁止终端删除源文件、需要访达手动清理并验证程序仍可运行的场景。
+description: Safely copy, verify, and hand off a macOS application bundle or one narrowly scoped application-data directory to external APFS, or guide an explicitly authorized consolidation of adjacent containers on one external APFS disk through a verified staging partition, UUID-locked destructive gates, resize, merge, rename, and reference repair. Use for macOS apps, games, media libraries, models, downloads, Wuthering Waves / 鸣潮, or external APFS partition/container consolidation when full verification and recoverable handoff are required. 安全迁移 macOS 程序或单个明确的数据目录，或在用户明确授权下通过已校验临时分区、UUID 锁定删除门、扩容、合并、改名和引用修复来整合同一外接磁盘上的相邻 APFS 容器。
 ---
 
 # macOS App and Data Migration / macOS 程序与数据迁移
@@ -33,6 +33,8 @@ python3 scripts/migrate_app_data.py audit \
 记录 bundle ID、主进程与辅助进程、沙盒状态、精确源路径、目标路径、外接宗卷格式、可用空间和最大文件。不得迁移整个 `~/Library`、整个容器、整个 `Application Support`，也不要把账户、凭据、钥匙串、活动数据库或锁文件当作大型资源一起搬走。
 
 陌生程序先读[兼容性说明（中文）](references/compatibility.zh-CN.md)。优先使用程序原生的存储位置设置；非沙盒程序才考虑软链接；沙盒程序必须有已经证明可用的文件夹授权或专用适配器。不能证明时停止，不复制后删除源数据。
+
+若任务是把同一块外接磁盘上的整个 APFS 容器经临时分区合并、扩容和改名，不要把宗卷根目录交给迁移脚本，也不要给脚本增加删除容器能力；改用独立的[外接 APFS 容器整合流程（中文）](references/apfs-container-consolidation.zh-CN.md)。该流程要求每次破坏性动作前按 UUID 重新解析目标，并覆盖 USB 重置、`ditto` 漏掉普通 `._` 文件、冲突归档、provenance 明示接受和最终扩容。
 
 ### 2. 预演并复制到外接 APFS
 
@@ -124,6 +126,8 @@ Run `inspect_app.py` and the `audit` command shown in the Chinese workflow. Reco
 
 For an unfamiliar app, read [Compatibility (English)](references/compatibility.en.md). Prefer an app-native location setting. Consider a symlink only for a non-sandboxed app. Require a proven folder authorization or purpose-built adapter for a sandboxed app. Stop with the source intact if the integration is unproven.
 
+When the task is whole-container merge, resize, and rename on one external disk through temporary staging, do not pass a volume root to the migrator or add container-deletion verbs to it. Follow the separate [External APFS container consolidation workflow (English)](references/apfs-container-consolidation.en.md). It resolves destructive targets by UUID immediately before use and covers USB resets, ordinary `._` files omitted by `ditto`, conflict archives, explicit provenance acceptance, and the final resize.
+
 ### 2. Dry-run and copy to external APFS
 
 Quit the app, updater, and every helper. The destination parent must already exist on a mounted external APFS volume. A new journal must include at least one `--process-name` for the app, updater, or helper; repeat the same flag for each relevant process. Run the `copy` command without `--execute`, review every character of both paths, then repeat the same command with `--execute`.
@@ -162,3 +166,4 @@ Use the dedicated [Wuthering Waves adapter (English)](references/wuthering-waves
 - `scripts/inspect_app.py`: read-only bundle, signature, entitlement, sandbox, process, and common-location inspection.
 - `scripts/build_wuthering_waves_launcher.sh`: builds the source-only security-scoped 鸣潮 launcher entirely on the selected target volume.
 - `assets/wuthering-waves-launcher/main.swift`: bilingual, parameterized launcher source. Never commit a generated local `.app`.
+- `references/apfs-container-consolidation.zh-CN.md` and `.en.md`: UUID-locked, fully verified external APFS staging, merge, rename, reference-repair, and final-resize procedure.

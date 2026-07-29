@@ -1,4 +1,4 @@
 interface:
   display_name: "macOS 程序与数据迁移 / App Data Migrator"
-  short_description: "Non-destructive macOS migration / 无损外接迁移"
-  default_prompt: "Use $migrate-macos-app-data / 使用 $migrate-macos-app-data，在不删除内置源文件、不使用 sudo、且不把临时迁移负载写入内置盘的前提下，把一个明确的 macOS 程序或数据目录复制、完整校验并通过访达交接到外接 APFS。"
+  short_description: "Verified macOS and APFS migration / 校验式外接迁移"
+  default_prompt: "Use $migrate-macos-app-data / 使用 $migrate-macos-app-data，安全复制并完整校验一个明确的 macOS 程序或数据目录，或按 UUID 锁定的临时分区流程整合同一外接磁盘上的相邻 APFS 容器；不使用 sudo，不把同盘暂存误称为备份，也不在未获明确授权时执行不可逆删除。"

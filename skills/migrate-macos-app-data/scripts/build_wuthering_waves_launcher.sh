@@ -229,6 +229,7 @@ if [[ ! -x "$swiftc_path" || ! -d "$macos_sdk_path" ]]; then
 fi
 "$swiftc_path" \
   -sdk "$macos_sdk_path" \
+  -target "$(uname -m)-apple-macosx13.0" \
   -parse-as-library \
   -O \
   -module-cache-path "$module_cache" \
