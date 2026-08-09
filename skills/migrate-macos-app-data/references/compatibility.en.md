@@ -6,6 +6,7 @@ Migrating identical bytes and migrating a working application are separate probl
 
 | Component | Preferred integration | When it fits | Risk that must be tested |
 |---|---|---|---|
+| `.app` inside a DMG | Mount read-only and copy directly to external APFS | The image contains a directly runnable app that needs no privileged installer | DMG integrity, mounted-source identity, destination signature, Gatekeeper, split user configuration, and updater behavior |
 | `.app` bundle | Launch directly from external APFS | The standalone app permits removable-volume execution | Signature, Gatekeeper, login items, and updater behavior at the new path |
 | Large data directory | App-native location setting | The app exposes a library, model, download, or game-content location | Whether all large data classes move and the setting survives relaunch |
 | Non-sandboxed data | Original-path symlink | The app and updater accept an external resolved target | Updates replacing the link and disconnection creating an empty directory |
@@ -18,6 +19,12 @@ python3 scripts/inspect_app.py "/absolute/path/App.app" --verify-signature
 ```
 
 Treat `Sandboxed: yes` as an unproven-symlink warning. Prefer the app's settings. If there is no native mechanism or tested adapter, keep the source intact and stop.
+
+## A direct DMG install is not an internal-app handoff
+
+An app inside a DMG is a transient read-only mounted source. Follow [Install directly from a DMG to external APFS](dmg-install.en.md): run `hdiutil verify`, prefer read-only `diskutil image attach`, and pass the mounted app to the generic copier with `--kind app`. Finish full `verify` and the platform-appropriate system-policy assessment before ejecting the image. When the journal has not reached `status: verified`, neither a destination signature nor a successful launch substitutes for source/destination verification.
+
+When no internal app existed, do not perform the app-migration Finder removal handoff. Preferences, plugins, login state, and small configuration normally remain under the user profile and must be recorded and accepted separately from the external app bundle. Stop on a `.pkg`, installer script, system extension, or privileged installation requirement and use the publisher's supported installer workflow instead of pretending it is a copyable app.
 
 ## Scope one exact component
 
@@ -49,8 +56,9 @@ Every condition is required:
 
 1. While the source still exists, verify the full tree, SHA-256 of every regular file, metadata, ACLs, extended attributes, symlinks, and hardlinks.
 2. Require strict deep signature verification for an `.app`.
-3. Launch the external copy, read existing content, and complete a safe write.
-4. Quit fully, relaunch successfully, and confirm new writes land externally.
-5. Check updater, login-item, helper, and sandbox behavior.
+3. For a DMG source, validate the image, finish full source/destination verification before detach, and assess the external target with Gatekeeper.
+4. Launch the external copy, read existing content, and complete a safe write.
+5. Quit fully, relaunch successfully, and confirm new writes land externally.
+6. Check updater, login-item, plugin, helper, and sandbox behavior.
 
 Do not guide the user to remove the internal source app or data until every condition passes.

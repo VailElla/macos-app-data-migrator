@@ -1,4 +1,4 @@
 interface:
   display_name: "macOS 程序与数据迁移 / App Data Migrator"
   short_description: "Verified macOS and APFS migration / 校验式外接迁移"
-  default_prompt: "Use $migrate-macos-app-data / 使用 $migrate-macos-app-data，安全复制并完整校验一个明确的 macOS 程序或数据目录，把 Docker.raw 稀疏虚拟磁盘导向 Docker 原生迁移流程，或按 UUID 锁定流程整合外接 APFS 容器；不使用 sudo，不放宽完整校验，也不在未获明确授权时执行不可逆删除。"
+  default_prompt: "Use $migrate-macos-app-data / 使用 $migrate-macos-app-data，把只读 DMG 中的程序直接安装到外接 APFS，安全复制并完整校验已有 macOS 程序或数据目录，把 Docker.raw 稀疏虚拟磁盘导向 Docker 原生迁移流程，或按 UUID 锁定流程整合外接 APFS 容器；不使用 sudo，不放宽完整校验，也不在未获明确授权时执行不可逆删除。"

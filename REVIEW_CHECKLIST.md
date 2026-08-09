@@ -7,6 +7,7 @@ This checklist is the GitHub publication gate. The repository owner should revie
 ## 1. 产品边界 / Product boundary
 
 - [ ] Skill 一次只迁移一个准确 `.app` 或一个准确数据目录。 / The Skill handles one exact `.app` or data directory at a time.
+- [ ] DMG 直装一次只选择镜像中的一个准确、无需特权安装的 `.app`；`.pkg`、系统扩展和安装脚本不冒充可复制应用。 / A direct DMG install selects one exact directly runnable `.app`; packages, system extensions, and installer scripts are never treated as copyable apps.
 - [ ] 程序与数据作为独立组件复制、校验和实测。 / Program and data are copied, verified, and smoke-tested independently.
 - [ ] 不宣称支持所有沙盒程序；接入方式未证明时停止。 / It does not claim universal sandbox support and stops when integration is unproven.
 - [ ] `SKILL.md` 和 README 对“接近零空间”与不可避免的少量 macOS 元数据写入解释准确。 / The near-zero-space and unavoidable small macOS metadata wording is accurate.
@@ -44,7 +45,16 @@ This checklist is the GitHub publication gate. The repository owner should revie
 - [ ] 非沙盒数据在证明软链接可用后才建立链接。 / Non-sandboxed data receives a link only after symlink compatibility is proven.
 - [ ] 沙盒数据要求程序原生设置、文件夹授权或专用适配器。 / Sandboxed data requires a native setting, folder authorization, or a dedicated adapter.
 
-## 6. 鸣潮适配器 / Wuthering Waves adapter
+## 6. DMG 直接安装 / Direct DMG installation
+
+- [ ] 对准确 DMG 记录 SHA-256、运行 `hdiutil verify`，并优先用 `diskutil image attach --readOnly --nobrowse` 挂载；旧系统才后备到 `hdiutil attach -readonly -nobrowse`，设备与挂载点来自本次输出和 `diskutil info`。 / The exact DMG receives a recorded SHA-256 and `hdiutil verify`, prefers `diskutil image attach --readOnly --nobrowse`, uses `hdiutil attach -readonly -nobrowse` only on older systems, and derives the device and mount point from the current output plus `diskutil info`.
+- [ ] 挂载 `.app` 作为 `--kind app` 源，通过预演、复制和完整 `verify`；日志达到 `status: verified` 后才卸载镜像。 / The mounted app is the `--kind app` source and passes dry-run, copy, and full `verify`; the image remains mounted until the journal reaches `status: verified`.
+- [ ] 外接目标通过严格代码签名和对应系统版本的策略验收：macOS 14 及以上优先 `syspolicy_check distribution`，旧系统才用 `spctl --assess`；成功启动不能替代源目标完整校验。 / The external target passes strict code-signature and the platform-appropriate policy gate: `syspolicy_check distribution` on macOS 14 or later, with `spctl --assess` only for older systems; a successful launch never substitutes for full source/destination verification.
+- [ ] 完成验收后用 `diskutil eject` 弹出本轮 attach 返回的准确映像设备；没有既有内置 `.app` 时不执行 Finder 程序删除交接、不建立原路径链接，下载 DMG 默认保留，明确清理时也只经访达移入废纸篓。 / After acceptance, `diskutil eject` targets the exact image device returned by this attach; with no existing internal app, there is no Finder app-removal handoff or original-path link, and the downloaded DMG is retained by default with explicit cleanup only through Finder Trash.
+- [ ] 验收分别记录外接应用、内置用户配置/插件和 MCP/命令行等后续集成，并验证完全退出、再次启动和外接盘生命周期。 / Acceptance records the external app, internal user configuration/plugins, and post-install MCP/CLI integrations separately, including full quit, relaunch, and external-volume lifecycle checks.
+- [ ] 双语 DMG 参考和匿名化真实案例不包含用户名、真实卷名、UUID、迁移日志或凭证。 / The bilingual DMG guides and anonymized real case contain no username, real volume name, UUID, migration journal, or credential.
+
+## 7. 鸣潮适配器 / Wuthering Waves adapter
 
 - [ ] 只迁移精确 `Saved/Resources`，不盲目迁移整个容器或 `Saved`。 / Only exact `Saved/Resources` is migrated, not the whole container or `Saved`.
 - [ ] 启动器的输出、Swift module cache 和临时目录都位于目标外接盘。 / Launcher output, Swift module cache, and temp directory all stay on the target external volume.
@@ -53,14 +63,14 @@ This checklist is the GitHub publication gate. The repository owner should revie
 - [ ] 生成的本机 `.app` 被 Git 忽略，不会公开。 / Generated machine-specific `.app` bundles are Git-ignored and never published.
 - [ ] 程序运行时派生缓存与迁移负载分开测量和披露，不承诺“运行时零增长”。 / Runtime-derived app caches are measured and disclosed separately from migration payload; zero runtime growth is not promised.
 
-## 7. 双语、隐私与开源材料 / Bilingual, privacy, and open-source materials
+## 8. 双语、隐私与开源材料 / Bilingual, privacy, and open-source materials
 
 - [ ] `SKILL.md`、README 及全部操作参考都有中文和英文。 / `SKILL.md`, README, and every operational reference are available in Chinese and English.
 - [ ] 没有本机用户名、真实卷名、卷 UUID、用户数据、日志、token、cookie 或密码。 / No local username, real volume name, UUID, user data, log, token, cookie, or password is present.
 - [ ] 没有提交生成的 `.app`、迁移日志、partial、缓存或 `.DS_Store`。 / No generated app, journal, partial, cache, or `.DS_Store` is committed.
 - [ ] MIT License 和 GitHub Actions 验证流程符合预期。 / The MIT License and GitHub Actions validation workflow are acceptable.
 
-## 8. 外接 APFS 容器整合 / External APFS container consolidation
+## 9. 外接 APFS 容器整合 / External APFS container consolidation
 
 - [ ] 整盘整合是独立的低自由度参考流程；`migrate_app_data.py` 仍不接受宗卷根目录，也没有删除容器子命令。 / Whole-disk consolidation remains a separate low-freedom reference; `migrate_app_data.py` still rejects volume roots and has no container-deletion command.
 - [ ] 每个删除、扩容或改名动作前按容器、宗卷和物理存储 UUID 重新解析动态 `diskN` 标识。 / Dynamic `diskN` identifiers are resolved again from container, volume, and physical-store UUIDs immediately before every delete, resize, or rename.
@@ -69,7 +79,7 @@ This checklist is the GitHub publication gate. The repository owner should revie
 - [ ] 受保护 provenance 例外会准确披露并取得用户明确接受，不会削弱普通数据的严格校验。 / Protected provenance exceptions are disclosed exactly and explicitly accepted by the user without weakening strict data verification.
 - [ ] 临时分区被明确标注为同盘暂存而非备份；只有最终行为测试、文件系统检查和完整校验通过后才删除并扩容到磁盘末尾。 / Temporary same-disk staging is explicitly not a backup and is deleted only after final behavior tests, filesystem checks, and full verification pass before resizing to the disk end.
 
-## 9. Docker Desktop 适配器 / Docker Desktop adapter
+## 10. Docker Desktop 适配器 / Docker Desktop adapter
 
 - [ ] `Docker.raw` 优先使用 Docker Desktop 官方 Disk image location 流程；文档明确不在访达中直接移动磁盘镜像。 / `Docker.raw` prefers Docker Desktop's supported Disk image location workflow, and docs explicitly reject a direct Finder move.
 - [ ] 通用迁移器检测到真实稀疏空洞或底层文件系统无法可靠检测空洞时，在任何目标或日志写入前停止，没有绕过参数。 / The generic migrator stops before any destination or journal write when it finds real sparse holes or the source filesystem cannot classify holes reliably, and exposes no bypass flag.
@@ -77,7 +87,7 @@ This checklist is the GitHub publication gate. The repository owner should revie
 - [ ] 验收覆盖 Docker Desktop 状态、实际 `Docker.raw` 句柄、容器写入/读回和完全重启，并防止外接盘缺失时启动。 / Acceptance covers Desktop status, actual `Docker.raw` handles, container write/readback, full restart, and refusing startup while the external disk is missing.
 - [ ] 用户跳过 SHA-256 时只报告“运行验证通过、字节完整性未证明”，不写入 `verified` 状态，不永久删除唯一恢复副本。 / Declining SHA-256 yields only “runtime validated; byte integrity unproven,” never `verified` state or permanent removal of the sole recovery copy.
 
-## 10. 本地验证 / Local validation
+## 11. 本地验证 / Local validation
 
 审查者可在仓库根目录运行： / Reviewers can run from the repository root:
 
@@ -100,7 +110,7 @@ git diff --check
 - [ ] 所有命令通过。 / Every command passes.
 - [ ] 测试的目标副本、日志、partial、构建目录和缓存位于一次性外接 APFS RAM 宗卷；内置临时目录只有小型源夹具，且不接触当前真实鸣潮迁移结果。 / Test destinations, journals, partials, build directories, and caches stay on a disposable external APFS RAM volume; only small source fixtures are internal, and the current real Wuthering Waves migration is untouched.
 
-## 11. 所有者决定 / Owner decision
+## 12. 所有者决定 / Owner decision
 
 - [ ] 我已审查并接受上述安全边界、功能范围、双语文案和 MIT License。 / I reviewed and accept the safety boundary, scope, bilingual wording, and MIT License.
 - [ ] 我明确授权下一步发布到 GitHub。 / I explicitly authorize the next GitHub publication step.
