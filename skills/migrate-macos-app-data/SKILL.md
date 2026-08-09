@@ -1,6 +1,6 @@
 ---
 name: migrate-macos-app-data
-description: Safely copy, verify, and hand off a macOS application bundle or one narrowly scoped application-data directory to external APFS, or guide an explicitly authorized consolidation of adjacent containers on one external APFS disk through a verified staging partition, UUID-locked destructive gates, resize, merge, rename, and reference repair. Use for macOS apps, games, media libraries, models, downloads, Wuthering Waves / 鸣潮, or external APFS partition/container consolidation when full verification and recoverable handoff are required. 安全迁移 macOS 程序或单个明确的数据目录，或在用户明确授权下通过已校验临时分区、UUID 锁定删除门、扩容、合并、改名和引用修复来整合同一外接磁盘上的相邻 APFS 容器。
+description: Safely copy, verify, and hand off a macOS application bundle or one narrowly scoped application-data directory to external APFS, route Docker Desktop sparse VM-disk relocation to its app-native workflow, or guide an explicitly authorized consolidation of adjacent containers on one external APFS disk through verified staging and UUID-locked destructive gates. Use for macOS apps, games, media libraries, models, downloads, Docker.raw or sparse virtual disks, Wuthering Waves / 鸣潮, and external APFS partition/container consolidation when strict verification and recoverable handoff are required. 安全迁移 macOS 程序或明确数据目录，把 Docker Desktop 稀疏虚拟磁盘导向应用原生流程，或通过已校验临时分区和 UUID 锁定删除门整合外接 APFS 容器。
 ---
 
 # macOS App and Data Migration / macOS 程序与数据迁移
@@ -35,6 +35,8 @@ python3 scripts/migrate_app_data.py audit \
 陌生程序先读[兼容性说明（中文）](references/compatibility.zh-CN.md)。优先使用程序原生的存储位置设置；非沙盒程序才考虑软链接；沙盒程序必须有已经证明可用的文件夹授权或专用适配器。不能证明时停止，不复制后删除源数据。
 
 若任务是把同一块外接磁盘上的整个 APFS 容器经临时分区合并、扩容和改名，不要把宗卷根目录交给迁移脚本，也不要给脚本增加删除容器能力；改用独立的[外接 APFS 容器整合流程（中文）](references/apfs-container-consolidation.zh-CN.md)。该流程要求每次破坏性动作前按 UUID 重新解析目标，并覆盖 USB 重置、`ditto` 漏掉普通 `._` 文件、冲突归档、provenance 明示接受和最终扩容。
+
+若发现 Docker Desktop、`Docker.raw`、虚拟机磁盘或稀疏文件，先读 [Docker Desktop 稀疏虚拟磁盘流程（中文）](references/docker-desktop.zh-CN.md)。通用复制器会在真实稀疏空洞上安全停止，因为 `ditto` 会展开空洞；优先使用 Docker 官方磁盘位置迁移。用户跳过 SHA-256 时不得声称完整校验成功，也不得给工具增加绕过参数。
 
 ### 2. 预演并复制到外接 APFS
 
@@ -128,6 +130,8 @@ For an unfamiliar app, read [Compatibility (English)](references/compatibility.e
 
 When the task is whole-container merge, resize, and rename on one external disk through temporary staging, do not pass a volume root to the migrator or add container-deletion verbs to it. Follow the separate [External APFS container consolidation workflow (English)](references/apfs-container-consolidation.en.md). It resolves destructive targets by UUID immediately before use and covers USB resets, ordinary `._` files omitted by `ditto`, conflict archives, explicit provenance acceptance, and the final resize.
 
+For Docker Desktop, `Docker.raw`, VM disks, or sparse files, first read [Docker Desktop sparse VM-disk migration (English)](references/docker-desktop.en.md). The generic copier stops safely on real sparse holes because `ditto` allocates them; prefer Docker's supported disk-location relocation. If the user declines SHA-256, never claim full verification or add a bypass flag.
+
 ### 2. Dry-run and copy to external APFS
 
 Quit the app, updater, and every helper. The destination parent must already exist on a mounted external APFS volume. A new journal must include at least one `--process-name` for the app, updater, or helper; repeat the same flag for each relevant process. Run the `copy` command without `--execute`, review every character of both paths, then repeat the same command with `--execute`.
@@ -167,3 +171,4 @@ Use the dedicated [Wuthering Waves adapter (English)](references/wuthering-waves
 - `scripts/build_wuthering_waves_launcher.sh`: builds the source-only security-scoped 鸣潮 launcher entirely on the selected target volume.
 - `assets/wuthering-waves-launcher/main.swift`: bilingual, parameterized launcher source. Never commit a generated local `.app`.
 - `references/apfs-container-consolidation.zh-CN.md` and `.en.md`: UUID-locked, fully verified external APFS staging, merge, rename, reference-repair, and final-resize procedure.
+- `references/docker-desktop.zh-CN.md` and `.en.md`: app-native Docker VM-disk relocation, sparse-allocation auditing, runtime proof, rollback, and degraded-assurance boundaries.

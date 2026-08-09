@@ -642,6 +642,51 @@ class MigrationTests(unittest.TestCase):
             )
             self.assertFalse(any(path.name.startswith(".migrate-partial.") for path in destination.iterdir()))
 
+    def test_sparse_file_audit_is_conservative_and_copy_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-sparse-file-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Virtual Disk"
+            destination = self.external_parent("sparse-file") / "Virtual Disk"
+            source.mkdir(parents=True)
+            sparse_file = source / "Example.raw"
+            logical_size = 32 * 1024 * 1024
+            with sparse_file.open("wb") as handle:
+                handle.truncate(logical_size)
+                handle.seek(0)
+                handle.write(b"begin")
+                handle.seek(logical_size - 3)
+                handle.write(b"end")
+
+            stats = MIGRATOR_MODULE.tree_stats(source)
+            self.assertEqual(stats["unique_bytes"], logical_size)
+            self.assertEqual(stats["space_efficient_files"], 1)
+            self.assertEqual(stats["sparse_files"], 1)
+            self.assertLess(stats["unique_allocated_bytes"], stats["unique_bytes"])
+
+            audit = run_migrator(
+                "audit",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+            )
+            self.assertIn("Unique allocated source", audit.stdout)
+            self.assertIn("Space-efficient files", audit.stdout)
+            self.assertIn("Sparse files / 稀疏文件: 1", audit.stdout)
+            self.assertIn("logical-size upper bound", audit.stdout)
+
+            refused = run_migrator(
+                *copy_arguments(source, destination),
+                "--execute",
+                check=False,
+            )
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("generic ditto copier would allocate their holes", refused.stderr)
+            self.assertFalse(destination.exists())
+            self.assertFalse(
+                (destination.parent / f".{destination.name}.migrate-macos-app-data.json").exists()
+            )
+
     def test_finder_handoff_requires_source_path_to_be_free_before_link(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-finder-") as temporary:
             root = Path(temporary)

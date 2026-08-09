@@ -45,6 +45,7 @@ macOS 自己仍可能写少量日志、TCC 权限记录、安全书签或偏好�
 - 已实测支持软链接的非沙盒程序数据
 - 有专用文件夹授权适配器的沙盒程序
 - 鸣潮 / Wuthering Waves 的源码级安全作用域启动器
+- Docker Desktop 稀疏虚拟磁盘的官方原生位置迁移与降级证明边界
 
 默认拒绝整个 `~/Library`、整个容器、活动数据库、同步根目录、非 APFS 目标以及未明确识别为外接的目标宗卷。
 
@@ -72,6 +73,10 @@ Skill 会先只读审计，再逐步停在每个真实审查门槛。不要从 R
 构建必须显式指定外接输出路径；编译缓存和临时目录同样位于该外接宗卷。生成的 `.app` 含本机绝对路径和 ad-hoc 签名，已被忽略，不能提交到 GitHub。
 
 真实 APFS 跨宗卷迁移的故障链、校验证据与回滚状态见[鸣潮 APFS 跨宗卷迁移验收记录](docs/cases/2026-07-29-wuthering-waves-cross-volume-migration.md)。
+
+### Docker Desktop 适配器
+
+`Docker.raw` 是逻辑大小可远大于实际分配的稀疏虚拟磁盘。只读审计会同时报告逻辑数据、源端实际分配和稀疏文件数；通用 `ditto` 复制会展开空洞，因此迁移器在执行前安全停止。请改用 Docker Desktop 官方 Disk image location 流程，并按 [Docker Desktop 稀疏虚拟磁盘说明](skills/migrate-macos-app-data/references/docker-desktop.zh-CN.md) 完成停机、回滚核对、实际分配和容器读写/重启验收。跳过 SHA-256 不能获得 `verified` 状态。
 
 ### 开发验证
 
@@ -133,6 +138,7 @@ For a data directory, after explicit authorization Codex normally moves the exac
 - Non-sandboxed app data with a proven symlink integration
 - Sandboxed data with a purpose-built folder-authorization adapter
 - The included source-level Wuthering Waves / 鸣潮 security-scoped launcher
+- Docker Desktop sparse VM disks through Docker's supported app-native relocation and explicit degraded-assurance boundaries
 
 The default policy rejects all of `~/Library`, whole containers, live databases, sync roots, non-APFS destinations, and volumes that are not explicitly identified as external.
 
@@ -153,6 +159,10 @@ The macOS game is App Sandbox constrained, so a plain symlink does not independe
 The builder requires an explicit external output. Its compiler cache and temporary directory stay on that same external volume. A generated `.app` embeds local absolute paths and an ad-hoc signature, is ignored by Git, and must never be published.
 
 See the [real APFS cross-volume migration case](docs/cases/2026-07-29-wuthering-waves-cross-volume-migration.md) for the observed failure chain, verification evidence, and rollback state.
+
+### Docker Desktop adapter
+
+`Docker.raw` is a sparse VM disk whose logical size can greatly exceed physical allocation. Read-only audit reports logical payload, source allocation, and sparse-file count. Because the generic `ditto` path allocates holes, the migrator stops before execution and routes the task to Docker Desktop's supported Disk image location workflow. Follow [Docker Desktop sparse VM-disk migration](skills/migrate-macos-app-data/references/docker-desktop.en.md) for quiescence, rollback checks, allocation review, and container read/write/restart acceptance. Declining SHA-256 never produces `verified` state.
 
 ### Development validation
 
