@@ -28,6 +28,8 @@ class SkillStructureTests(unittest.TestCase):
             "recovery.en.md",
             "wuthering-waves.zh-CN.md",
             "wuthering-waves.en.md",
+            "dmg-install.zh-CN.md",
+            "dmg-install.en.md",
             "apfs-container-consolidation.zh-CN.md",
             "apfs-container-consolidation.en.md",
         )
@@ -54,6 +56,7 @@ class SkillStructureTests(unittest.TestCase):
     def test_default_prompt_names_the_skill(self) -> None:
         metadata = (SKILL_ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
         self.assertIn("$migrate-macos-app-data", metadata)
+        self.assertIn("只读 DMG", metadata)
         self.assertIsNotNone(re.search(r'(?m)^  short_description: ".{25,64}"$', metadata))
 
     def test_low_space_and_finder_safety_contract_is_present(self) -> None:
@@ -69,6 +72,12 @@ class SkillStructureTests(unittest.TestCase):
         wuthering_zh = (SKILL_ROOT / "references" / "wuthering-waves.zh-CN.md").read_text(
             encoding="utf-8"
         )
+        dmg_en = (SKILL_ROOT / "references" / "dmg-install.en.md").read_text(
+            encoding="utf-8"
+        )
+        dmg_zh = (SKILL_ROOT / "references" / "dmg-install.zh-CN.md").read_text(
+            encoding="utf-8"
+        )
         consolidation_en = (
             SKILL_ROOT / "references" / "apfs-container-consolidation.en.md"
         ).read_text(encoding="utf-8")
@@ -77,6 +86,9 @@ class SkillStructureTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         checklist = (REPO_ROOT / "REVIEW_CHECKLIST.md").read_text(encoding="utf-8")
+        dmg_case = (
+            REPO_ROOT / "docs" / "cases" / "2026-08-08-blender-dmg-external-install.md"
+        ).read_text(encoding="utf-8")
         builder = (SKILL_ROOT / "scripts" / "build_wuthering_waves_launcher.sh").read_text(
             encoding="utf-8"
         )
@@ -111,6 +123,28 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("source-present provenance and every other xattr must still match exactly", skill)
         self.assertIn("至少记录一个相关进程", skill)
         self.assertIn("at least one app, updater, or helper process", skill)
+        self.assertIn("从 DMG 直接安装到外接 APFS", skill)
+        self.assertIn("Install directly from a DMG to external APFS", skill)
+        self.assertIn("hdiutil verify", dmg_zh)
+        self.assertIn("hdiutil verify", dmg_en)
+        self.assertIn("-readonly -nobrowse", dmg_zh)
+        self.assertIn("-readonly -nobrowse", dmg_en)
+        self.assertIn("--kind app", dmg_zh)
+        self.assertIn("--kind app", dmg_en)
+        self.assertIn("spctl --assess", dmg_zh)
+        self.assertIn("spctl --assess", dmg_en)
+        self.assertIn("不执行程序迁移的 Finder 删除交接", dmg_zh)
+        self.assertIn("does not use the app-migration Finder removal handoff", dmg_en)
+        self.assertIn("用户配置、插件或偏好的实际路径", dmg_zh)
+        self.assertIn("user-configuration, plugin, and preference paths", dmg_en)
+        self.assertIn("从 DMG 直接安装", readme)
+        self.assertIn("Install directly from a DMG", readme)
+        self.assertIn("DMG 直接安装", checklist)
+        self.assertIn("Direct DMG installation", checklist)
+        self.assertIn("6,496", dmg_case)
+        self.assertIn("Notarized Developer ID", dmg_case)
+        self.assertIn("22 个工具", dmg_case)
+        self.assertIn("22 tools", dmg_case)
         self.assertIn("外接 APFS 容器整合流程", skill)
         self.assertIn("External APFS container consolidation workflow", skill)
         self.assertIn("容器 UUID", consolidation_zh)
