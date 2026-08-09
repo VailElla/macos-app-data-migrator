@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -661,6 +662,7 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(stats["unique_bytes"], logical_size)
             self.assertEqual(stats["space_efficient_files"], 1)
             self.assertEqual(stats["sparse_files"], 1)
+            self.assertEqual(stats["sparse_detection_unavailable_files"], 0)
             self.assertLess(stats["unique_allocated_bytes"], stats["unique_bytes"])
 
             audit = run_migrator(
@@ -682,6 +684,32 @@ class MigrationTests(unittest.TestCase):
             )
             self.assertEqual(refused.returncode, 2)
             self.assertIn("generic ditto copier would allocate their holes", refused.stderr)
+            self.assertFalse(destination.exists())
+            self.assertFalse(
+                (destination.parent / f".{destination.name}.migrate-macos-app-data.json").exists()
+            )
+
+            with mock.patch.object(
+                MIGRATOR_MODULE.os,
+                "lseek",
+                side_effect=OSError(errno.ENOTSUP, "SEEK_HOLE unavailable"),
+            ):
+                unknown_stats = MIGRATOR_MODULE.tree_stats(source)
+                self.assertEqual(unknown_stats["sparse_files"], 0)
+                self.assertEqual(unknown_stats["sparse_detection_unavailable_files"], 1)
+                arguments = argparse.Namespace(
+                    source=str(source),
+                    destination=str(destination),
+                    kind="auto",
+                    process_name=["NoSuchMigratorProcess"],
+                    execute=True,
+                )
+                with self.assertRaisesRegex(
+                    MIGRATOR_MODULE.MigrationError,
+                    "Sparse-hole detection is unavailable",
+                ):
+                    MIGRATOR_MODULE.command_copy(arguments)
+
             self.assertFalse(destination.exists())
             self.assertFalse(
                 (destination.parent / f".{destination.name}.migrate-macos-app-data.json").exists()

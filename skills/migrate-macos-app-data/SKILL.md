@@ -36,7 +36,7 @@ python3 scripts/migrate_app_data.py audit \
 
 若任务是把同一块外接磁盘上的整个 APFS 容器经临时分区合并、扩容和改名，不要把宗卷根目录交给迁移脚本，也不要给脚本增加删除容器能力；改用独立的[外接 APFS 容器整合流程（中文）](references/apfs-container-consolidation.zh-CN.md)。该流程要求每次破坏性动作前按 UUID 重新解析目标，并覆盖 USB 重置、`ditto` 漏掉普通 `._` 文件、冲突归档、provenance 明示接受和最终扩容。
 
-若发现 Docker Desktop、`Docker.raw`、虚拟机磁盘或稀疏文件，先读 [Docker Desktop 稀疏虚拟磁盘流程（中文）](references/docker-desktop.zh-CN.md)。通用复制器会在真实稀疏空洞上安全停止，因为 `ditto` 会展开空洞；优先使用 Docker 官方磁盘位置迁移。用户跳过 SHA-256 时不得声称完整校验成功，也不得给工具增加绕过参数。
+若发现 Docker Desktop、`Docker.raw`、虚拟机磁盘或稀疏文件，先读 [Docker Desktop 稀疏虚拟磁盘流程（中文）](references/docker-desktop.zh-CN.md)。通用复制器会在真实稀疏空洞上安全停止，因为 `ditto` 会展开空洞；底层文件系统无法可靠检测空洞时同样失败关闭，不把未知结果当作非稀疏文件。优先使用 Docker 官方磁盘位置迁移。用户跳过 SHA-256 时不得声称完整校验成功，也不得给工具增加绕过参数。
 
 ### 2. 预演并复制到外接 APFS
 
@@ -130,7 +130,7 @@ For an unfamiliar app, read [Compatibility (English)](references/compatibility.e
 
 When the task is whole-container merge, resize, and rename on one external disk through temporary staging, do not pass a volume root to the migrator or add container-deletion verbs to it. Follow the separate [External APFS container consolidation workflow (English)](references/apfs-container-consolidation.en.md). It resolves destructive targets by UUID immediately before use and covers USB resets, ordinary `._` files omitted by `ditto`, conflict archives, explicit provenance acceptance, and the final resize.
 
-For Docker Desktop, `Docker.raw`, VM disks, or sparse files, first read [Docker Desktop sparse VM-disk migration (English)](references/docker-desktop.en.md). The generic copier stops safely on real sparse holes because `ditto` allocates them; prefer Docker's supported disk-location relocation. If the user declines SHA-256, never claim full verification or add a bypass flag.
+For Docker Desktop, `Docker.raw`, VM disks, or sparse files, first read [Docker Desktop sparse VM-disk migration (English)](references/docker-desktop.en.md). The generic copier stops safely on real sparse holes because `ditto` allocates them. It also fails closed when the source filesystem cannot classify holes reliably instead of treating an unknown result as non-sparse. Prefer Docker's supported disk-location relocation. If the user declines SHA-256, never claim full verification or add a bypass flag.
 
 ### 2. Dry-run and copy to external APFS
 

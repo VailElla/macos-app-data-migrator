@@ -26,7 +26,7 @@ This checklist is the GitHub publication gate. The repository owner should revie
 - [ ] 目标已有不同文件时拒绝覆盖。 / A differing pre-existing destination file is never overwritten.
 - [ ] 中断后可使用相同日志与命令续传，源仍保持不变。 / The same journal and command resume an interruption while the source remains unchanged.
 - [ ] 接近 APFS `NAME_MAX` 的合法源文件名不会因 partial 命名变长而复制失败；普通 `._` 前缀文件不会被当作可忽略旁车。 / A legal source filename near APFS `NAME_MAX` does not fail because the partial name grows, and ordinary `._`-prefixed files are not treated as ignorable sidecars.
-- [ ] 审计分开报告逻辑负载、源端实际分配与真实稀疏文件；通用复制器不会静默展开稀疏空洞。 / Audit separately reports logical payload, source allocation, and real sparse files; the generic copier never silently expands sparse holes.
+- [ ] 审计分开报告逻辑负载、源端实际分配、真实稀疏文件与检测不可用文件；通用复制器不会静默展开稀疏空洞，也不会把未知结果当作非稀疏文件。 / Audit separately reports logical payload, source allocation, real sparse files, and files whose holes cannot be classified; the generic copier never silently expands sparse holes or treats an unknown result as non-sparse.
 
 ## 4. 内置空间与删除策略 / Internal space and removal policy
 
@@ -72,7 +72,7 @@ This checklist is the GitHub publication gate. The repository owner should revie
 ## 9. Docker Desktop 适配器 / Docker Desktop adapter
 
 - [ ] `Docker.raw` 优先使用 Docker Desktop 官方 Disk image location 流程；文档明确不在访达中直接移动磁盘镜像。 / `Docker.raw` prefers Docker Desktop's supported Disk image location workflow, and docs explicitly reject a direct Finder move.
-- [ ] 通用迁移器检测到真实稀疏空洞时在任何目标或日志写入前停止，没有绕过参数。 / The generic migrator stops on real sparse holes before any destination or journal write and exposes no bypass flag.
+- [ ] 通用迁移器检测到真实稀疏空洞或底层文件系统无法可靠检测空洞时，在任何目标或日志写入前停止，没有绕过参数。 / The generic migrator stops before any destination or journal write when it finds real sparse holes or the source filesystem cannot classify holes reliably, and exposes no bypass flag.
 - [ ] 原生迁移失败时先证明已回滚到可读的原环境，不自动编辑 Docker 设置文件或创建软链接。 / A failed native relocation must be proven rolled back to a readable original environment; settings-file edits and symlink fallbacks are not automated.
 - [ ] 验收覆盖 Docker Desktop 状态、实际 `Docker.raw` 句柄、容器写入/读回和完全重启，并防止外接盘缺失时启动。 / Acceptance covers Desktop status, actual `Docker.raw` handles, container write/readback, full restart, and refusing startup while the external disk is missing.
 - [ ] 用户跳过 SHA-256 时只报告“运行验证通过、字节完整性未证明”，不写入 `verified` 状态，不永久删除唯一恢复副本。 / Declining SHA-256 yields only “runtime validated; byte integrity unproven,” never `verified` state or permanent removal of the sole recovery copy.

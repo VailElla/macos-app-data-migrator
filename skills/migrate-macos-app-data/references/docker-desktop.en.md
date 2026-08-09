@@ -6,7 +6,7 @@ This workflow covers only the Linux VM disk used by Docker Desktop for macOS. Tr
 
 - Prefer Docker Desktop's supported **Settings → Resources → Advanced → Disk image location → Browse** workflow. Docker explicitly warns against moving the disk image directly in Finder because Desktop can lose track of it.
 - `Docker.raw` is a large sparse file. Its logical size can greatly exceed physical allocation; do not substitute Finder size, `st_size`, or apparent free space for both logical and allocated-size auditing.
-- Generic `migrate_app_data.py copy` stops safely when it finds real sparse holes because its `ditto` path allocates those holes. Do not add a bypass flag. Use app-native relocation or first implement and validate a dedicated sparse copier.
+- Generic `migrate_app_data.py copy` stops safely when it finds real sparse holes because its `ditto` path allocates those holes. It also stops when the source filesystem cannot classify holes reliably; an unknown result is never treated as non-sparse. Do not add a bypass flag. Use app-native relocation or first implement and validate a dedicated sparse copier.
 - Do not move the Docker `.app` with the VM disk, edit Docker settings files to pretend the backend switched, or use `sudo`.
 - Behavior tests do not replace SHA-256. If the user explicitly declines hashing, report only “runtime validated; byte integrity unproven.” Never write `verified` state or permanently remove the sole recovery copy on that basis.
 

@@ -76,7 +76,7 @@ Skill 会先只读审计，再逐步停在每个真实审查门槛。不要从 R
 
 ### Docker Desktop 适配器
 
-`Docker.raw` 是逻辑大小可远大于实际分配的稀疏虚拟磁盘。只读审计会同时报告逻辑数据、源端实际分配和稀疏文件数；通用 `ditto` 复制会展开空洞，因此迁移器在执行前安全停止。请改用 Docker Desktop 官方 Disk image location 流程，并按 [Docker Desktop 稀疏虚拟磁盘说明](skills/migrate-macos-app-data/references/docker-desktop.zh-CN.md) 完成停机、回滚核对、实际分配和容器读写/重启验收。跳过 SHA-256 不能获得 `verified` 状态。
+`Docker.raw` 是逻辑大小可远大于实际分配的稀疏虚拟磁盘。只读审计会同时报告逻辑数据、源端实际分配、稀疏文件数和无法可靠检测空洞的文件数；通用 `ditto` 复制会展开空洞，因此迁移器在执行前安全停止。底层文件系统不支持可靠空洞检测时也会失败关闭，不把未知结果当作非稀疏文件。请改用 Docker Desktop 官方 Disk image location 流程，并按 [Docker Desktop 稀疏虚拟磁盘说明](skills/migrate-macos-app-data/references/docker-desktop.zh-CN.md) 完成停机、回滚核对、实际分配和容器读写/重启验收。跳过 SHA-256 不能获得 `verified` 状态。
 
 ### 开发验证
 
@@ -162,7 +162,7 @@ See the [real APFS cross-volume migration case](docs/cases/2026-07-29-wuthering-
 
 ### Docker Desktop adapter
 
-`Docker.raw` is a sparse VM disk whose logical size can greatly exceed physical allocation. Read-only audit reports logical payload, source allocation, and sparse-file count. Because the generic `ditto` path allocates holes, the migrator stops before execution and routes the task to Docker Desktop's supported Disk image location workflow. Follow [Docker Desktop sparse VM-disk migration](skills/migrate-macos-app-data/references/docker-desktop.en.md) for quiescence, rollback checks, allocation review, and container read/write/restart acceptance. Declining SHA-256 never produces `verified` state.
+`Docker.raw` is a sparse VM disk whose logical size can greatly exceed physical allocation. Read-only audit reports logical payload, source allocation, sparse-file count, and files whose holes cannot be classified reliably. Because the generic `ditto` path allocates holes, the migrator stops before execution and routes the task to Docker Desktop's supported Disk image location workflow. It also fails closed when the source filesystem cannot provide reliable hole detection, rather than treating an unknown result as non-sparse. Follow [Docker Desktop sparse VM-disk migration](skills/migrate-macos-app-data/references/docker-desktop.en.md) for quiescence, rollback checks, allocation review, and container read/write/restart acceptance. Declining SHA-256 never produces `verified` state.
 
 ### Development validation
 
