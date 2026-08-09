@@ -18,7 +18,7 @@ A bilingual Codex Skill for installing a macOS app from a DMG directly onto exte
 - 迁移日志、临时副本、Swift 构建目录和缓存全部位于目标外接盘。
 - 每个普通文件都做 SHA-256，完整校验还比较目录树、权限、ACL、扩展属性、resource fork、软链接和硬链接。`.app` 根目录上脚本明确列出的 macOS 实例属性（包括 `com.apple.provenance`）属于实例元数据，允许源目标不同；应用包内部条目只允许目标端新增的受保护 `com.apple.provenance`，若源端已有则源目标必须完全一致。普通数据与其他所有 xattr 仍严格比较。
 - `.app` 额外执行严格深层代码签名校验。
-- DMG 直装先验证并只读挂载镜像，把挂载源 `.app` 交给同一个复制器；必须在卸载前完成完整校验，并对外接目标执行 Gatekeeper 评估。
+- DMG 直装先校验镜像并用 `diskutil image attach` 只读挂载，把挂载源 `.app` 交给同一个复制器；弹出前完成完整校验，并对外接目标执行严格签名与当前系统策略评估。
 - 删除内置 `.app` 时，工具只在访达中定位并由用户亲自移到废纸篓。数据目录默认在用户明确授权后，由 Codex 通过访达移到废纸篓但不清空；用户明确偏好时才改用同级 `.internal-backup`。建立原路径软链接前，必须提供准确的 Finder 恢复路径并由工具用源快照、inode 和设备号证明回滚副本仍是原目录。
 - 不请求管理员密码、不使用 `sudo`，不用终端命令删除内置程序或数据。
 - 对沙盒程序不假设软链接可用；没有原生位置设置或已验证适配器时停止并保留源文件。
@@ -47,12 +47,13 @@ macOS 自己仍可能写少量日志、TCC 权限记录、安全书签或偏好�
 - 已实测支持软链接的非沙盒程序数据
 - 有专用文件夹授权适配器的沙盒程序
 - 鸣潮 / Wuthering Waves 的源码级安全作用域启动器
+- Docker Desktop 稀疏虚拟磁盘的官方原生位置迁移与降级证明边界
 
 默认拒绝整个 `~/Library`、整个容器、活动数据库、同步根目录、非 APFS 目标以及未明确识别为外接的目标宗卷。
 
 ### 从 DMG 直接安装
 
-DMG 中的 `.app` 是临时只读源，不是等待删除的内置旧程序。流程会记录 DMG 指纹和挂载身份，先预演并复制到外接 APFS，再在镜像仍挂载时完成源目标全量校验、严格代码签名和 Gatekeeper 检查。没有既有内置 `.app` 时不执行 Finder 删除交接，下载的 DMG 也不会自动删除。
+DMG 中的 `.app` 是临时只读源，不是等待删除的内置旧程序。流程会记录 DMG 指纹和挂载身份，先预演并复制到外接 APFS，再在镜像仍挂载时完成源目标全量校验、严格代码签名和系统策略检查；macOS 14 及以上优先 `syspolicy_check distribution`。没有既有内置 `.app` 时不执行 Finder 删除交接，下载的 DMG 也不会自动删除。
 
 程序包、用户配置和后续集成分别验收：大型 `.app` 可以在外接盘，偏好、插件、登录状态或 MCP/命令行配置仍可能留在用户目录。详见[从 DMG 直接安装到外接 APFS](skills/migrate-macos-app-data/references/dmg-install.zh-CN.md)及[匿名化 Blender 验收案例](docs/cases/2026-08-08-blender-dmg-external-install.md)。
 
@@ -80,6 +81,10 @@ Skill 会先只读审计，再逐步停在每个真实审查门槛。不要从 R
 构建必须显式指定外接输出路径；编译缓存和临时目录同样位于该外接宗卷。生成的 `.app` 含本机绝对路径和 ad-hoc 签名，已被忽略，不能提交到 GitHub。
 
 真实 APFS 跨宗卷迁移的故障链、校验证据与回滚状态见[鸣潮 APFS 跨宗卷迁移验收记录](docs/cases/2026-07-29-wuthering-waves-cross-volume-migration.md)。
+
+### Docker Desktop 适配器
+
+`Docker.raw` 是逻辑大小可远大于实际分配的稀疏虚拟磁盘。只读审计会同时报告逻辑数据、源端实际分配、稀疏文件数和无法可靠检测空洞的文件数；通用 `ditto` 复制会展开空洞，因此迁移器在执行前安全停止。底层文件系统不支持可靠空洞检测时也会失败关闭，不把未知结果当作非稀疏文件。请改用 Docker Desktop 官方 Disk image location 流程，并按 [Docker Desktop 稀疏虚拟磁盘说明](skills/migrate-macos-app-data/references/docker-desktop.zh-CN.md) 完成停机、回滚核对、实际分配和容器读写/重启验收。跳过 SHA-256 不能获得 `verified` 状态。
 
 ### 开发验证
 
@@ -114,7 +119,7 @@ read-only audit → external-only copy → full source/destination verification 
 - Journals, partial copies, Swift build directories, and caches stay on the target external volume.
 - Every regular file is SHA-256 checked; full verification also compares the tree, permissions, ACLs, extended attributes, resource forks, symlinks, and hardlinks. Script-listed macOS instance attributes on the `.app` root (including `com.apple.provenance`) are instance metadata and may differ between source and destination. For app descendants, only a destination-only protected `com.apple.provenance` is allowed; when the source already has it, source and destination must match exactly. Data migrations and every other xattr remain strict.
 - An `.app` additionally receives strict deep code-signature verification.
-- A direct DMG install validates and mounts the image read-only, sends the mounted source app through the same copier, completes full verification before detach, and assesses the external target with Gatekeeper.
+- A direct DMG install validates the image, mounts it read-only with `diskutil image attach`, sends the mounted source app through the same copier, completes full verification before eject, and assesses the external target with strict signing plus current system policy.
 - For an internal `.app`, the helper only reveals the exact item and the user moves it to Trash. For a data directory, after explicit authorization Codex normally moves the exact source to Trash through Finder without emptying Trash; a sibling `.internal-backup` is used only when the user explicitly prefers it. Before `link`, provide the exact recovery path and the explicit Finder-handoff attestation; the helper compares the saved source snapshot, inode, and device so a missing source cannot be mistaken for permanent deletion.
 - It never requests an administrator password, uses `sudo`, or deletes internal app/data paths from Terminal.
 - It does not assume a symlink crosses an app sandbox. Without a native location setting or tested adapter, it stops with the source intact.
@@ -143,12 +148,13 @@ For a data directory, after explicit authorization Codex normally moves the exac
 - Non-sandboxed app data with a proven symlink integration
 - Sandboxed data with a purpose-built folder-authorization adapter
 - The included source-level Wuthering Waves / 鸣潮 security-scoped launcher
+- Docker Desktop sparse VM disks through Docker's supported app-native relocation and explicit degraded-assurance boundaries
 
 The default policy rejects all of `~/Library`, whole containers, live databases, sync roots, non-APFS destinations, and volumes that are not explicitly identified as external.
 
 ### Install directly from a DMG
 
-An app inside a DMG is a transient read-only source, not an old internal program awaiting removal. The workflow records the DMG fingerprint and mounted-volume identity, dry-runs and copies to external APFS, and finishes full source/destination verification, strict code-signature validation, and Gatekeeper assessment while the image remains mounted. With no pre-existing internal app, there is no Finder removal handoff and the downloaded DMG is never deleted automatically.
+An app inside a DMG is a transient read-only source, not an old internal program awaiting removal. The workflow records the DMG fingerprint and mounted-volume identity, dry-runs and copies to external APFS, and finishes full source/destination verification, strict code-signature validation, and system-policy assessment while the image remains mounted; macOS 14 or later prefers `syspolicy_check distribution`. With no pre-existing internal app, there is no Finder removal handoff and the downloaded DMG is never deleted automatically.
 
 The app bundle, user configuration, and post-install integrations are accepted separately: the large app may live externally while preferences, plugins, login state, MCP configuration, or command-line bridges remain under the user profile. See [Install directly from a DMG to external APFS](skills/migrate-macos-app-data/references/dmg-install.en.md) and the [anonymized Blender acceptance case](docs/cases/2026-08-08-blender-dmg-external-install.md).
 
@@ -169,6 +175,10 @@ The macOS game is App Sandbox constrained, so a plain symlink does not independe
 The builder requires an explicit external output. Its compiler cache and temporary directory stay on that same external volume. A generated `.app` embeds local absolute paths and an ad-hoc signature, is ignored by Git, and must never be published.
 
 See the [real APFS cross-volume migration case](docs/cases/2026-07-29-wuthering-waves-cross-volume-migration.md) for the observed failure chain, verification evidence, and rollback state.
+
+### Docker Desktop adapter
+
+`Docker.raw` is a sparse VM disk whose logical size can greatly exceed physical allocation. Read-only audit reports logical payload, source allocation, sparse-file count, and files whose holes cannot be classified reliably. Because the generic `ditto` path allocates holes, the migrator stops before execution and routes the task to Docker Desktop's supported Disk image location workflow. It also fails closed when the source filesystem cannot provide reliable hole detection, rather than treating an unknown result as non-sparse. Follow [Docker Desktop sparse VM-disk migration](skills/migrate-macos-app-data/references/docker-desktop.en.md) for quiescence, rollback checks, allocation review, and container read/write/restart acceptance. Declining SHA-256 never produces `verified` state.
 
 ### Development validation
 

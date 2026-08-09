@@ -1,6 +1,6 @@
 ---
 name: migrate-macos-app-data
-description: Safely install a macOS application from a read-only DMG to external APFS, copy and verify an existing application bundle or one narrowly scoped application-data directory, or guide an explicitly authorized consolidation of adjacent external APFS containers through verified staging and UUID-locked destructive gates. Use for macOS apps, DMG installers, games, media libraries, models, downloads, Wuthering Waves / 鸣潮, or external APFS consolidation when full verification and recoverable handoff are required. 安全地把只读 DMG 中的 macOS 程序安装到外接 APFS，复制并校验已有程序或明确数据目录，或通过已校验暂存和 UUID 锁定删除门整合外接 APFS 容器。
+description: Safely install a directly runnable macOS app from a read-only DMG to external APFS, copy and verify an existing application bundle or one narrowly scoped app-data directory, route Docker Desktop sparse VM-disk relocation to its app-native workflow, or guide an explicitly authorized consolidation of adjacent external APFS containers through verified staging and UUID-locked destructive gates. Use for macOS apps, DMG installers, games, media libraries, models, downloads, Docker.raw or sparse virtual disks, Wuthering Waves / 鸣潮, and external APFS consolidation when strict verification and recoverable handoff are required. 安全地把只读 DMG 中可直接运行的 macOS 程序安装到外接 APFS，复制并校验已有程序或明确数据目录，把 Docker Desktop 稀疏虚拟磁盘导向应用原生流程，或通过已校验暂存和 UUID 锁定删除门整合外接 APFS 容器。
 ---
 
 # macOS App and Data Migration / macOS 程序与数据迁移
@@ -34,9 +34,11 @@ python3 scripts/migrate_app_data.py audit \
 
 陌生程序先读[兼容性说明（中文）](references/compatibility.zh-CN.md)。优先使用程序原生的存储位置设置；非沙盒程序才考虑软链接；沙盒程序必须有已经证明可用的文件夹授权或专用适配器。不能证明时停止，不复制后删除源数据。
 
-若用户提供的是 `.dmg`，改用[从 DMG 直接安装到外接 APFS（中文）](references/dmg-install.zh-CN.md)。先验证磁盘映像并以只读方式挂载，把挂载宗卷中的准确 `.app` 作为 `--kind app` 源；必须在卸载镜像前完成 `copy`、完整 `verify`、目标签名和 Gatekeeper 检查。DMG 直装没有内置 `.app` 源，因此不执行 4A 的内置程序访达交接，也不自动删除下载的 DMG。
+若用户提供的是 `.dmg`，改用[从 DMG 直接安装到外接 APFS（中文）](references/dmg-install.zh-CN.md)。先验证磁盘映像并用当前 `diskutil image attach` 只读挂载，把挂载宗卷中的准确 `.app` 作为 `--kind app` 源；必须在弹出镜像前完成 `copy`、完整 `verify`、目标签名和当前系统策略检查。macOS 14 及以上优先用 `syspolicy_check distribution`，旧系统才后备到 `spctl`。DMG 直装没有内置 `.app` 源，因此不执行 4A 的内置程序访达交接，也不自动删除下载的 DMG。
 
 若任务是把同一块外接磁盘上的整个 APFS 容器经临时分区合并、扩容和改名，不要把宗卷根目录交给迁移脚本，也不要给脚本增加删除容器能力；改用独立的[外接 APFS 容器整合流程（中文）](references/apfs-container-consolidation.zh-CN.md)。该流程要求每次破坏性动作前按 UUID 重新解析目标，并覆盖 USB 重置、`ditto` 漏掉普通 `._` 文件、冲突归档、provenance 明示接受和最终扩容。
+
+若发现 Docker Desktop、`Docker.raw`、虚拟机磁盘或稀疏文件，先读 [Docker Desktop 稀疏虚拟磁盘流程（中文）](references/docker-desktop.zh-CN.md)。通用复制器会在真实稀疏空洞上安全停止，因为 `ditto` 会展开空洞；底层文件系统无法可靠检测空洞时同样失败关闭，不把未知结果当作非稀疏文件。优先使用 Docker 官方磁盘位置迁移。用户跳过 SHA-256 时不得声称完整校验成功，也不得给工具增加绕过参数。
 
 ### 2. 预演并复制到外接 APFS
 
@@ -130,9 +132,11 @@ Run `inspect_app.py` and the `audit` command shown in the Chinese workflow. Reco
 
 For an unfamiliar app, read [Compatibility (English)](references/compatibility.en.md). Prefer an app-native location setting. Consider a symlink only for a non-sandboxed app. Require a proven folder authorization or purpose-built adapter for a sandboxed app. Stop with the source intact if the integration is unproven.
 
-When the user supplies a `.dmg`, follow [Install directly from a DMG to external APFS (English)](references/dmg-install.en.md). Verify and mount the image read-only, then use the exact `.app` on the mounted volume as the `--kind app` source. Finish `copy`, full `verify`, destination signature, and Gatekeeper assessment before detaching the image. A direct DMG install has no internal app source, so the internal-app Finder handoff in 4A does not apply and the downloaded DMG is never deleted automatically.
+When the user supplies a `.dmg`, follow [Install directly from a DMG to external APFS (English)](references/dmg-install.en.md). Verify the image and mount it read-only with the current `diskutil image attach`, then use the exact `.app` on the mounted volume as the `--kind app` source. Finish `copy`, full `verify`, destination signature, and the current system-policy assessment before ejecting the image. Prefer `syspolicy_check distribution` on macOS 14 or later and fall back to `spctl` only on older systems. A direct DMG install has no internal app source, so the internal-app Finder handoff in 4A does not apply and the downloaded DMG is never deleted automatically.
 
 When the task is whole-container merge, resize, and rename on one external disk through temporary staging, do not pass a volume root to the migrator or add container-deletion verbs to it. Follow the separate [External APFS container consolidation workflow (English)](references/apfs-container-consolidation.en.md). It resolves destructive targets by UUID immediately before use and covers USB resets, ordinary `._` files omitted by `ditto`, conflict archives, explicit provenance acceptance, and the final resize.
+
+For Docker Desktop, `Docker.raw`, VM disks, or sparse files, first read [Docker Desktop sparse VM-disk migration (English)](references/docker-desktop.en.md). The generic copier stops safely on real sparse holes because `ditto` allocates them. It also fails closed when the source filesystem cannot classify holes reliably instead of treating an unknown result as non-sparse. Prefer Docker's supported disk-location relocation. If the user declines SHA-256, never claim full verification or add a bypass flag.
 
 ### 2. Dry-run and copy to external APFS
 
@@ -174,5 +178,6 @@ Use the dedicated [Wuthering Waves adapter (English)](references/wuthering-waves
 - `scripts/inspect_app.py`: read-only bundle, signature, entitlement, sandbox, process, and common-location inspection.
 - `scripts/build_wuthering_waves_launcher.sh`: builds the source-only security-scoped 鸣潮 launcher entirely on the selected target volume.
 - `assets/wuthering-waves-launcher/main.swift`: bilingual, parameterized launcher source. Never commit a generated local `.app`.
-- `references/dmg-install.zh-CN.md` and `.en.md`: read-only DMG validation, mounted-app copy/verification, Gatekeeper assessment, split-state recording, and image cleanup.
+- `references/dmg-install.zh-CN.md` and `.en.md`: read-only DMG validation, mounted-app copy/verification, current system-policy assessment, split-state recording, and image cleanup.
 - `references/apfs-container-consolidation.zh-CN.md` and `.en.md`: UUID-locked, fully verified external APFS staging, merge, rename, reference-repair, and final-resize procedure.
+- `references/docker-desktop.zh-CN.md` and `.en.md`: app-native Docker VM-disk relocation, sparse-allocation auditing, runtime proof, rollback, and degraded-assurance boundaries.

@@ -22,7 +22,7 @@ Treat `Sandboxed: yes` as an unproven-symlink warning. Prefer the app's settings
 
 ## A direct DMG install is not an internal-app handoff
 
-An app inside a DMG is a transient read-only mounted source. Follow [Install directly from a DMG to external APFS](dmg-install.en.md): run `hdiutil verify`, mount read-only, and pass the mounted app to the generic copier with `--kind app`. Finish full `verify` before detaching the image. When the journal has not reached `status: verified`, neither a destination signature nor a successful launch substitutes for source/destination verification.
+An app inside a DMG is a transient read-only mounted source. Follow [Install directly from a DMG to external APFS](dmg-install.en.md): run `hdiutil verify`, prefer read-only `diskutil image attach`, and pass the mounted app to the generic copier with `--kind app`. Finish full `verify` and the platform-appropriate system-policy assessment before ejecting the image. When the journal has not reached `status: verified`, neither a destination signature nor a successful launch substitutes for source/destination verification.
 
 When no internal app existed, do not perform the app-migration Finder removal handoff. Preferences, plugins, login state, and small configuration normally remain under the user profile and must be recorded and accepted separately from the external app bundle. Stop on a `.pkg`, installer script, system extension, or privileged installation requirement and use the publisher's supported installer workflow instead of pretending it is a copyable app.
 

@@ -53,6 +53,8 @@ bundle ID                         = org.blenderfoundation.blender
 版本                              = 5.2.0
 ```
 
+这次历史验收使用的是 `spctl`。当前发布流程已按 Apple 后续工具指引更新：macOS 14 及以上优先运行 `syspolicy_check distribution`，只有旧系统才把 `spctl --assess --type execute` 作为后备；本案例不追溯声称运行过当时未执行的检查。
+
 迁移日志证明挂载 `.app` 与外接目标一致，但当时的日志 schema 不保存下载 DMG 的文件 SHA-256 或 `hdiutil verify` 结果。本案例因此推动新增 DMG 专用文档门槛；本次 PR 不改变已验证的复制器或日志 schema。
 
 ## 内外盘分离状态
@@ -95,7 +97,7 @@ MCP 和命令行桥接配置不属于 `.app` 复制负载。它们需要单独�
 
 This case installed Blender 5.2.0 for Apple Silicon from a mounted DMG directly onto external APFS. The generic app copier journal reached `verified` for 6,496 regular files and 934,330,035 logical bytes. Every file SHA-256, stable snapshot, metadata, ACL, xattr, hardlink/isolation, and strict deep code-signature gate passed; the tool did not delete its source.
 
-The external app also passed Gatekeeper as a notarized Developer ID build. Blender user preferences and plugins remained as approximately 432 KiB under `~/Library/Application Support/Blender/5.2`, separate from the roughly 906 MB external app bundle.
+The external app also passed the then-recorded `spctl` Gatekeeper assessment as a notarized Developer ID build. Current guidance prefers `syspolicy_check distribution` on macOS 14 or later and keeps `spctl` only as an older-system fallback; this historical case does not retroactively claim that newer check. Blender user preferences and plugins remained as approximately 432 KiB under `~/Library/Application Support/Blender/5.2`, separate from the roughly 906 MB external app bundle.
 
 A local-only Blender MCP integration was then enabled and accepted independently: `initialize` succeeded, `tools/list` returned 22 tools, and a read-only scene query succeeded. No external asset service or API key was enabled.
 

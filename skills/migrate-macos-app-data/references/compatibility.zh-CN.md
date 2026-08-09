@@ -22,7 +22,7 @@ python3 scripts/inspect_app.py "/absolute/path/App.app" --verify-signature
 
 ## DMG 直装不是内置程序交接
 
-DMG 中的 `.app` 是临时挂载的只读源。先按[从 DMG 直接安装到外接 APFS](dmg-install.zh-CN.md)运行 `hdiutil verify` 和只读挂载，再把挂载源交给通用复制器并使用 `--kind app`。必须在卸载镜像前完成完整 `verify`；若日志未达到 `status: verified`，不能用目标签名或成功启动替代源目标校验。
+DMG 中的 `.app` 是临时挂载的只读源。先按[从 DMG 直接安装到外接 APFS](dmg-install.zh-CN.md)运行 `hdiutil verify`，优先用 `diskutil image attach` 只读挂载，再把挂载源交给通用复制器并使用 `--kind app`。必须在弹出镜像前完成完整 `verify` 和对应系统版本的策略检查；若日志未达到 `status: verified`，不能用目标签名或成功启动替代源目标校验。
 
 没有既有内置 `.app` 时，不执行程序迁移的 Finder 删除交接。偏好、插件、登录状态和小型配置通常仍留在用户目录，应与外接应用包分别记录和验收。若镜像包含 `.pkg`、安装脚本、系统扩展或要求管理员权限，停止并改走对应厂商安装流程，本技能不把它伪装成可复制应用。
 
