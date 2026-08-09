@@ -30,6 +30,8 @@ class SkillStructureTests(unittest.TestCase):
             "wuthering-waves.en.md",
             "apfs-container-consolidation.zh-CN.md",
             "apfs-container-consolidation.en.md",
+            "docker-desktop.zh-CN.md",
+            "docker-desktop.en.md",
         )
         for reference in references:
             self.assertTrue((SKILL_ROOT / "references" / reference).is_file(), msg=reference)
@@ -75,6 +77,12 @@ class SkillStructureTests(unittest.TestCase):
         consolidation_zh = (
             SKILL_ROOT / "references" / "apfs-container-consolidation.zh-CN.md"
         ).read_text(encoding="utf-8")
+        docker_en = (SKILL_ROOT / "references" / "docker-desktop.en.md").read_text(
+            encoding="utf-8"
+        )
+        docker_zh = (SKILL_ROOT / "references" / "docker-desktop.zh-CN.md").read_text(
+            encoding="utf-8"
+        )
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         checklist = (REPO_ROOT / "REVIEW_CHECKLIST.md").read_text(encoding="utf-8")
         builder = (SKILL_ROOT / "scripts" / "build_wuthering_waves_launcher.sh").read_text(
@@ -123,6 +131,20 @@ class SkillStructureTests(unittest.TestCase):
         self.assertIn("explicit user acceptance", consolidation_en)
         self.assertIn("resizeContainer", consolidation_zh)
         self.assertIn("resizeContainer", consolidation_en)
+        self.assertIn("Docker Desktop 稀疏虚拟磁盘流程", skill)
+        self.assertIn("Docker Desktop sparse VM-disk migration", skill)
+        self.assertIn("Disk image location", docker_zh)
+        self.assertIn("Disk image location", docker_en)
+        self.assertIn("字节级完整性未证明", docker_zh)
+        self.assertIn("byte integrity unproven", docker_en)
+        self.assertIn("不要由本 Skill 重新创建", docker_zh)
+        self.assertIn("must not recreate one", docker_en)
+        self.assertIn('"sparse_files": 0', migrator)
+        self.assertIn('"sparse_detection_unavailable_files": 0', migrator)
+        self.assertIn("Sparse files require a dedicated app-native adapter", migrator)
+        self.assertIn("refuses to treat an unknown result as non-sparse", migrator)
+        self.assertIn("allocate their holes", migrator)
+        self.assertNotIn("--skip-hash", migrator)
         self.assertIn("写入 `verified` 状态前", skill)
         self.assertIn("before committing `verified` state", skill)
         self.assertIn("应用内部条目只允许目标端新增的受保护 provenance", checklist)

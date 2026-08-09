@@ -30,6 +30,7 @@ STATE_SUFFIX = ".migrate-macos-app-data.json"
 COPY_OVERHEAD_BYTES = 64 * 1024 * 1024
 PROCESS_CHECK_INTERVAL = 5.0
 CHUNK_SIZE = 8 * 1024 * 1024
+STAT_BLOCK_BYTES = 512
 XATTR_NOFOLLOW = 0x0001
 ACL_TYPE_EXTENDED = 0x00000100
 
@@ -256,6 +257,34 @@ def iter_tree(root: Path) -> Iterable[Tuple[str, Path, os.stat_result]]:
                 stack.append((child_relative, Path(entry.path)))
 
 
+def file_has_sparse_holes(path: Path, metadata: os.stat_result) -> Optional[bool]:
+    """Return whether a file has holes, or None when the filesystem cannot prove it."""
+    allocated_bytes = int(getattr(metadata, "st_blocks", 0)) * STAT_BLOCK_BYTES
+    if metadata.st_size <= 0 or allocated_bytes >= metadata.st_size:
+        return False
+    seek_hole = getattr(os, "SEEK_HOLE", None)
+    if seek_hole is None:
+        return None
+    descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        try:
+            first_hole = os.lseek(descriptor, 0, seek_hole)
+        except OSError as error:
+            unsupported_errors = {
+                errno.EINVAL,
+                errno.ENOTSUP,
+                errno.ENXIO,
+                errno.ENOSYS,
+                errno.EOPNOTSUPP,
+            }
+            if error.errno in unsupported_errors:
+                return None
+            raise
+        return first_hole < metadata.st_size
+    finally:
+        os.close(descriptor)
+
+
 def tree_stats(root: Path) -> Dict[str, Any]:
     stats: Dict[str, Any] = {
         "files": 0,
@@ -264,6 +293,10 @@ def tree_stats(root: Path) -> Dict[str, Any]:
         "special": 0,
         "logical_bytes": 0,
         "unique_bytes": 0,
+        "unique_allocated_bytes": 0,
+        "space_efficient_files": 0,
+        "sparse_files": 0,
+        "sparse_detection_unavailable_files": 0,
         "largest_file": 0,
     }
     seen_inodes = set()
@@ -279,6 +312,15 @@ def tree_stats(root: Path) -> Dict[str, Any]:
             if inode_key not in seen_inodes:
                 seen_inodes.add(inode_key)
                 stats["unique_bytes"] += metadata.st_size
+                allocated_bytes = int(getattr(metadata, "st_blocks", 0)) * STAT_BLOCK_BYTES
+                stats["unique_allocated_bytes"] += allocated_bytes
+                if allocated_bytes < metadata.st_size:
+                    stats["space_efficient_files"] += 1
+                    sparse_status = file_has_sparse_holes(_path, metadata)
+                    if sparse_status is True:
+                        stats["sparse_files"] += 1
+                    elif sparse_status is None:
+                        stats["sparse_detection_unavailable_files"] += 1
         elif stat.S_ISLNK(metadata.st_mode):
             stats["symlinks"] += 1
         else:
@@ -553,13 +595,31 @@ def print_audit(source: Path, destination: Path, kind: str, stats: Dict[str, Any
     print(f"  Directories / 目录: {stats['directories']}")
     print(f"  Symlinks / 软链接: {stats['symlinks']}")
     print(f"  Logical size / 逻辑大小: {format_bytes(stats['logical_bytes'])}")
-    print(f"  Unique payload / 去重后数据: {format_bytes(stats['unique_bytes'])}")
+    print(f"  Unique logical payload / 去重后逻辑数据: {format_bytes(stats['unique_bytes'])}")
+    print(
+        "  Unique allocated source / 去重后源端已分配: "
+        f"{format_bytes(stats['unique_allocated_bytes'])}"
+    )
+    print(
+        "  Space-efficient files / 稀疏或压缩候选文件: "
+        f"{stats['space_efficient_files']}"
+    )
+    print(f"  Sparse files / 稀疏文件: {stats['sparse_files']}")
+    print(
+        "  Sparse detection unavailable / 稀疏检测不可用: "
+        f"{stats['sparse_detection_unavailable_files']}"
+    )
     print(f"  Largest file / 最大文件: {format_bytes(stats['largest_file'])}")
     print(f"  Destination free / 目标可用: {format_bytes(int(info['free_bytes']))}")
     print(f"  Filesystem / 文件系统: {info.get('filesystem') or 'unknown'}")
     print(f"  External / 外接: {info.get('internal') is False}")
     print(f"  Mount point / 挂载点: {info.get('mount_point') or 'unknown'}")
     print("  Source mutation / 源路径改动: none / 无")
+    if stats["space_efficient_files"]:
+        print(
+            "  Capacity policy / 容量策略: logical-size upper bound; verify allocation after copy / "
+            "按逻辑大小保守计算；复制后必须复核实际分配"
+        )
 
 
 def command_audit(arguments: argparse.Namespace) -> None:
@@ -1126,6 +1186,17 @@ def command_copy(arguments: argparse.Namespace) -> None:
     if stats["special"]:
         raise MigrationError("Source contains special files / 源目录包含不支持的特殊文件")
     print_audit(source, destination, kind, stats, destination_info)
+    if stats["sparse_files"]:
+        raise MigrationError(
+            "Sparse files require a dedicated app-native adapter; the generic ditto copier would "
+            "allocate their holes / 稀疏文件必须使用专用的应用原生适配器；通用 ditto 复制会展开空洞"
+        )
+    if stats["sparse_detection_unavailable_files"]:
+        raise MigrationError(
+            "Sparse-hole detection is unavailable for one or more space-efficient files; the "
+            "generic ditto copier refuses to treat an unknown result as non-sparse / 一个或多个"
+            "空间高效文件无法检测稀疏空洞；通用 ditto 复制器拒绝把未知结果当作非稀疏文件"
+        )
     snapshot = source_snapshot(source)
     existing_state = load_state(destination, required=False)
     if existing_state is None and lexists(destination):
