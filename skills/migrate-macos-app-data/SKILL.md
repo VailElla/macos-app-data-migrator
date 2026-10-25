@@ -95,6 +95,8 @@ python3 scripts/migrate_app_data.py reveal \
 
 标准本机废纸篓中，Finder 也可能在恢复目录及其子目录新建 `.DS_Store` 并连带更新这些父目录的 mtime。只有完整校验日志已记录用户明确接受的 `DS_STORE_ONLY` 例外、恢复路径准确位于当前用户的 `~/.Trash`、根 inode/设备号匹配、每个被归一化的目录都直接包含 `.DS_Store`、时间变化发生在完整校验之后，并且所有非例外文件哈希、其余元数据、目录树与硬链接仍与已校验目标一致时，`link` 才接受这些父目录时间变化。
 
+`verify` 会冻结源和目标的逐项校验证据。首次 `link` 必须同时核对恢复副本和目标：恢复副本的每个条目都须保留原始身份、属主/属组、权限、软链接目标、ACL、扩展属性及文件哈希，只有上述明确例外可以归一化；不能仅凭两个当前副本互相一致就放行。首次交接成功后，重复 `link` 仍核验恢复副本及原始证据，但允许应用正常修改工作目标。缺少不可变元数据证据的旧日志会安全停止，须在原始源仍可用时重新 `verify` 后再交接。
+
 ```bash
 python3 scripts/migrate_app_data.py link \
   --source "/exact/original/data" \
@@ -175,6 +177,8 @@ After full verification, run `reveal`. By default, after explicit user authoriza
 For an iCloud Drive File Provider source, Finder Trash deterministically clears `UF_HIDDEN` across the tree, updates the recovery-root timestamp, and adds private Put Back xattrs while preserving the root inode and bytes. `link` accepts this normalization only when the exact File Provider Put Back marker exists, root inode/device match, tree and hardlink topology match, every non-exception regular file matches both the verified destination and the journaled SHA-256, and no other metadata differs. The handoff receipt records the normalization without storing private xattr values.
 
 In the standard local Trash, Finder may also create `.DS_Store` inside the recovery root or descendants and thereby update those parent-directory mtimes. `link` accepts only those parent mtime changes when the journal already records the user's explicit `DS_STORE_ONLY` acceptance, the recovery path is exactly inside the current user's `~/.Trash`, root inode/device match, each normalized directory directly contains `.DS_Store`, the timestamp change occurred after full verification, and every non-exception hash, all other metadata, tree structure, and hardlink topology still match the verified destination.
+
+`verify` freezes per-entry source and destination evidence. The first `link` checks both the recovery copy and destination: every recovery entry must retain its original identity, ownership, permissions, symlink target, ACL, xattrs, and file hash except for the explicitly documented normalizations. Agreement between two current copies alone is insufficient. After the first handoff, repeated `link` calls still validate the recovery copy against the original evidence while allowing normal application writes to the working destination. Old journals lacking immutable metadata fail closed; repeat `verify` while the original source is available before handoff.
 
 A symlink consumes only a small amount of filesystem metadata; it is the only intentional internal write when original-path compatibility is required.
 

@@ -1628,7 +1628,9 @@ def command_verify(arguments: argparse.Namespace) -> None:
     allow_destination_only_provenance = bool(
         getattr(arguments, "allow_destination_only_provenance", False)
     )
-    verified_source_snapshot = source_snapshot(source)
+    kind = str(state["kind"])
+    verified_source_records = verification_stability_snapshot(collect_verification_entries(source), kind)
+    verified_destination_records = verification_stability_snapshot(collect_verification_entries(destination), kind)
     exception_records: List[Dict[str, Any]] = []
     if allow_ds_store_exception:
         exception_records.append(
@@ -1661,14 +1663,17 @@ def command_verify(arguments: argparse.Namespace) -> None:
     )
     if state.get("kind") == "app":
         verify_app_signature(destination)
-    # A long full-tree hash can outlive an application restart. Do not commit
-    # the verified state while a recorded app, updater, or helper is running,
-    # even when it has not yet changed a migrated file.
-    require_processes_stopped(process_names)
-    if source_snapshot(source) != verified_source_snapshot:
+    if verification_stability_snapshot(collect_verification_entries(source), kind) != verified_source_records:
         raise MigrationError("Source changed during verification / 校验期间源目录发生变化")
+    if verification_stability_snapshot(collect_verification_entries(destination), kind) != verified_destination_records:
+        raise MigrationError("Destination changed during verification / 校验期间目标目录发生变化")
+    # Hashing and metadata scans can outlive an app restart; check immediately
+    # before committing the verified evidence even if no file has changed yet.
+    require_processes_stopped(process_names)
     state["file_sha256"] = hashes
-    state["verified_source_snapshot"] = verified_source_snapshot
+    state["verified_source_snapshot"] = snapshot_from_verification_records(verified_source_records)
+    state["verified_source_records"] = verified_source_records
+    state["verified_destination_records"] = verified_destination_records
     state["status"] = "linked" if state.get("status") == "linked" else "verified"
     state["verified_at"] = time.time()
     state["full_verification"] = {
@@ -1704,69 +1709,17 @@ def validate_reveal_path(source: Path, requested: Optional[str]) -> Path:
     return candidate
 
 
-def validate_recovery_receipt(
-    source: Path,
-    destination: Path,
-    state: Dict[str, Any],
-    recovery_path: Path,
-) -> Dict[str, Any]:
-    """Prove that the supplied Finder recovery path is the journaled source tree."""
-    if recovery_path == source or recovery_path == destination or is_within(recovery_path, destination):
-        raise MigrationError(
-            "Recovery path must be separate from source and destination / "
-            "恢复路径必须独立于源路径和目标路径"
-        )
-    if recovery_path.is_symlink() or not recovery_path.is_dir():
-        raise MigrationError(
-            f"Recovery path is not a real directory / 恢复路径不是实体目录: {recovery_path}"
-        )
-
-    expected_snapshot = state.get("verified_source_snapshot", state.get("source_snapshot"))
-    if not isinstance(expected_snapshot, dict) or "." not in expected_snapshot:
-        raise MigrationError(
-            "Migration journal has no source snapshot for handoff proof / "
-            "迁移日志没有可用于交接证明的源快照"
-        )
-    try:
-        actual_snapshot = source_snapshot(recovery_path)
-    except OSError as error:
-        raise MigrationError(
-            f"Cannot inspect recovery path / 无法检查恢复路径: {recovery_path}: {error}"
-        ) from error
-    has_fileprovider_marker = (
-        actual_snapshot != expected_snapshot
-        and FILE_PROVIDER_TRASH_PUT_BACK_XATTR
-        in xattr_map(recovery_path, follow_symlinks=False)
-    )
-    if (
-        actual_snapshot != expected_snapshot
-        and not has_fileprovider_marker
-        and is_standard_finder_trash_recovery(recovery_path)
-    ):
-        return validate_standard_finder_trash_recovery(
-            destination,
-            state,
-            recovery_path,
-            expected_snapshot,
-            actual_snapshot,
-        )
-    if actual_snapshot != expected_snapshot:
-        return validate_fileprovider_trash_recovery(
-            destination,
-            state,
-            recovery_path,
-            expected_snapshot,
-            actual_snapshot,
-        )
-
-    root_record = actual_snapshot["."]
-    return {
-        "recovery_path": str(recovery_path),
-        "device": root_record.get("device"),
-        "inode": root_record.get("inode"),
-        "snapshot_matches": True,
-        "verified_at": time.time(),
-    }
+def snapshot_from_verification_records(
+    records: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    snapshot = {}
+    for relative, record in records.items():
+        entry = dict(record["_stability_stat"])
+        entry.pop("ctime_ns", None)
+        if record["type"] == "symlink":
+            entry["link_target"] = record["link_target"]
+        snapshot[relative] = entry
+    return snapshot
 
 
 def verification_exception_enabled(state: Dict[str, Any], exception_type: str) -> bool:
@@ -1781,169 +1734,51 @@ def is_standard_finder_trash_recovery(recovery_path: Path) -> bool:
     return recovery_path.parent == Path.home() / ".Trash"
 
 
-def validate_standard_finder_trash_recovery(
-    destination: Path,
-    state: Dict[str, Any],
-    recovery_path: Path,
-    expected_snapshot: Dict[str, Dict[str, Any]],
-    actual_snapshot: Dict[str, Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Validate only Finder-created `.DS_Store` effects in the user's Trash."""
-    expected_root = expected_snapshot.get(".")
-    actual_root = actual_snapshot.get(".")
-    if not isinstance(expected_root, dict) or not isinstance(actual_root, dict) or (
-        actual_root.get("device") != expected_root.get("device")
-        or actual_root.get("inode") != expected_root.get("inode")
+def require_verification_records(state: Dict[str, Any], key: str) -> Dict[str, Dict[str, Any]]:
+    records = state.get(key)
+    if not isinstance(records, dict) or "." not in records or any(
+        not isinstance(record, dict)
+        or not isinstance(record.get("_stability_stat"), dict)
+        or not isinstance(record.get("xattrs"), dict)
+        for record in records.values()
     ):
         raise MigrationError(
-            "Recovery path does not match the journaled source tree / "
-            "恢复路径与日志中的源目录树不一致"
+            "Migration journal lacks immutable verification metadata; "
+            "repeat verify while the original source is available before Finder handoff / "
+            "迁移日志缺少不可变校验元数据；请在原始源仍可用时重新 verify，再进行访达交接"
         )
-    if not verification_exception_enabled(state, "DS_STORE_ONLY"):
-        raise MigrationError(
-            "Recovery path does not match the journaled source tree / "
-            "恢复路径与日志中的源目录树不一致"
-        )
+    return records
 
-    all_recovery_entries = collect_verification_entries(recovery_path)
-    ds_store_parent_paths = {
-        "." if relative.count("/") == 0 else str(Path(relative).parent)
-        for relative in all_recovery_entries
-        if is_ds_store_entry(relative)
-    }
-    recovery_entries = {
-        relative: entry
-        for relative, entry in all_recovery_entries.items()
-        if not is_ds_store_entry(relative)
-    }
-    destination_entries = {
-        relative: entry
-        for relative, entry in collect_verification_entries(destination).items()
-        if not is_ds_store_entry(relative)
-    }
-    if set(recovery_entries) != set(destination_entries):
-        raise MigrationError(
-            "Recovery path does not match the verified destination tree / "
-            "恢复路径与已校验目标目录树不一致"
-        )
 
-    expected_hashes = state.get("file_sha256")
-    regular_paths = {
-        relative
-        for relative, (_path, metadata) in recovery_entries.items()
-        if stat.S_ISREG(metadata.st_mode)
-    }
-    if not isinstance(expected_hashes, dict) or set(expected_hashes) != regular_paths:
-        raise MigrationError(
-            "Migration journal lacks the complete verified recovery hashes / "
-            "迁移日志缺少完整的恢复文件校验哈希"
-        )
-
-    kind = str(state.get("kind"))
-    allow_destination_only_provenance = verification_exception_enabled(
-        state, "DESTINATION_ONLY_PROVENANCE"
-    )
-    recovery_before = verification_stability_snapshot(recovery_entries, kind)
-    destination_before = verification_stability_snapshot(destination_entries, kind)
-    if hardlink_topology(
-        recovery_entries, require_destination_isolation=False
-    ) != hardlink_topology(destination_entries, require_destination_isolation=True):
-        raise MigrationError(
-            "Recovery hardlink topology differs from the verified destination / "
-            "恢复目录的硬链接结构与已校验目标不同"
-        )
-
-    directory_mtimes_normalized: List[str] = []
-    for relative in sorted(recovery_entries):
-        recovery_path_entry, _recovery_metadata = recovery_entries[relative]
-        destination_path_entry, _destination_metadata = destination_entries[relative]
-        recovery_record = dict(recovery_before[relative])
-        destination_record = dict(destination_before[relative])
-        recovery_expected = recovery_record.pop("_stability_stat")
-        destination_expected = destination_record.pop("_stability_stat")
-        recovery_record["xattrs"] = dict(recovery_record["xattrs"])
-        destination_record["xattrs"] = dict(destination_record["xattrs"])
-        normalize_destination_only_app_xattrs(
-            recovery_record,
-            destination_record,
-            kind,
-            allow_data_destination_only_provenance=allow_destination_only_provenance,
-        )
-
-        if recovery_record != destination_record and (
-            recovery_record.get("type") == "directory"
-            and relative in ds_store_parent_paths
-        ):
-            recovery_mtime = recovery_record.get("mtime_ns")
-            destination_mtime = destination_record.get("mtime_ns")
-            verified_at_ns = int(float(state.get("verified_at", 0)) * 1_000_000_000)
-            normalized_destination = dict(destination_record)
-            normalized_destination["mtime_ns"] = recovery_mtime
-            if (
-                isinstance(recovery_mtime, int)
-                and isinstance(destination_mtime, int)
-                and recovery_mtime >= destination_mtime
-                and recovery_mtime >= verified_at_ns
-                and recovery_record == normalized_destination
-            ):
-                destination_record = normalized_destination
-                directory_mtimes_normalized.append(relative)
-
-        if recovery_record != destination_record:
-            raise MigrationError(
-                f"Recovery metadata differs / 恢复目录元数据不一致: {relative}"
-            )
-        if recovery_record["type"] == "file":
-            recovery_hash = stable_sha256_file(
-                recovery_path_entry, recovery_expected, relative
-            )
-            destination_hash = stable_sha256_file(
-                destination_path_entry, destination_expected, relative
-            )
-            if recovery_hash != destination_hash or recovery_hash != expected_hashes[relative]:
-                raise MigrationError(
-                    f"Recovery SHA-256 mismatch / 恢复目录 SHA-256 不一致: {relative}"
-                )
-
-    recovery_after_entries = {
-        relative: entry
-        for relative, entry in collect_verification_entries(recovery_path).items()
-        if not is_ds_store_entry(relative)
-    }
-    destination_after_entries = {
-        relative: entry
-        for relative, entry in collect_verification_entries(destination).items()
-        if not is_ds_store_entry(relative)
-    }
-    if verification_stability_snapshot(recovery_after_entries, kind) != recovery_before:
-        raise MigrationError("Recovery tree changed during validation / 校验期间恢复目录发生变化")
-    if verification_stability_snapshot(destination_after_entries, kind) != destination_before:
-        raise MigrationError(
-            "Destination changed during recovery validation / 恢复校验期间目标目录发生变化"
-        )
-
+def non_exception_entries(entries: Dict[str, Any], allow_ds_store: bool) -> Dict[str, Any]:
     return {
-        "recovery_path": str(recovery_path),
-        "device": actual_root.get("device"),
-        "inode": actual_root.get("inode"),
-        "snapshot_matches": False,
-        "journal_root_identity_matches": True,
-        "verified_destination_tree_matches": True,
-        "all_non_exception_regular_files_match_journal_hashes": True,
-        "finder_trash_ds_store_metadata": {
-            "explicit_ds_store_exception_recorded": True,
-            "ds_store_parent_directory_mtimes": directory_mtimes_normalized,
-        },
-        "verified_at": time.time(),
+        relative: entry
+        for relative, entry in entries.items()
+        if not (allow_ds_store and is_ds_store_entry(relative))
     }
+
+
+def verify_journal_hashes(
+    entries: Dict[str, Tuple[Path, os.stat_result]],
+    records: Dict[str, Dict[str, Any]],
+    state: Dict[str, Any],
+) -> None:
+    hashes = state.get("file_sha256")
+    regular_paths = {relative for relative, record in records.items() if record["type"] == "file"}
+    if not isinstance(hashes, dict) or set(hashes) != regular_paths:
+        raise MigrationError("Migration journal lacks complete verified hashes / 迁移日志缺少完整的已验证哈希")
+    for relative in sorted(regular_paths):
+        digest = stable_sha256_file(entries[relative][0], records[relative]["_stability_stat"], relative)
+        if digest != hashes[relative]:
+            raise MigrationError(f"Recovery SHA-256 mismatch / 恢复目录 SHA-256 不一致: {relative}")
 
 
 def stabilize_fileprovider_trash_entries(
     recovery_path: Path,
     attempts: int = 8,
-) -> Tuple[Dict[str, Tuple[Path, os.stat_result]], Dict[str, Dict[str, Any]]]:
+) -> Dict[str, Tuple[Path, os.stat_result]]:
     """Wait for lazy File Provider flag/ctime normalization to reach a fixed point."""
-    previous: Optional[Dict[str, Dict[str, Any]]] = None
+    previous = None
     for _attempt in range(attempts):
         entries = collect_verification_entries(recovery_path)
         stability = {
@@ -1951,239 +1786,148 @@ def stabilize_fileprovider_trash_entries(
             for relative, (_path, metadata) in entries.items()
         }
         if stability == previous:
-            snapshot: Dict[str, Dict[str, Any]] = {}
-            for relative, (path, metadata) in entries.items():
-                record = metadata_signature(metadata)
-                if stat.S_ISLNK(metadata.st_mode):
-                    record["link_target"] = os.readlink(str(path))
-                snapshot[relative] = record
-            return entries, snapshot
+            return entries
         previous = stability
-    raise MigrationError(
-        "File Provider recovery metadata did not stabilize / "
-        "文件提供器恢复目录的元数据未稳定"
+    raise MigrationError("File Provider recovery metadata did not stabilize / 文件提供器恢复目录的元数据未稳定")
+
+
+def validate_verified_destination(destination: Path, state: Dict[str, Any]) -> None:
+    """Check the initial handoff against frozen verification evidence, not a live peer."""
+    allow_ds_store = verification_exception_enabled(state, "DS_STORE_ONLY")
+    expected = non_exception_entries(
+        require_verification_records(state, "verified_destination_records"), allow_ds_store
     )
+    entries = non_exception_entries(collect_verification_entries(destination), allow_ds_store)
+    records = verification_stability_snapshot(entries, str(state["kind"]))
+    if records != expected:
+        raise MigrationError("Verified destination changed before handoff / 已校验目标在交接前发生变化")
+    verify_journal_hashes(entries, records, state)
+    after = non_exception_entries(collect_verification_entries(destination), allow_ds_store)
+    if verification_stability_snapshot(after, str(state["kind"])) != records:
+        raise MigrationError("Destination changed during recovery validation / 恢复校验期间目标目录发生变化")
 
 
-def validate_fileprovider_trash_recovery(
+def validate_recovery_receipt(
+    source: Path,
     destination: Path,
     state: Dict[str, Any],
     recovery_path: Path,
-    expected_snapshot: Dict[str, Dict[str, Any]],
-    actual_snapshot: Dict[str, Dict[str, Any]],
+    *,
+    check_destination: bool = True,
 ) -> Dict[str, Any]:
-    """Validate the narrow metadata rewrite made by Finder's File Provider Trash.
+    """Validate the recovery tree against immutable pre-handoff source evidence."""
+    if recovery_path == source or recovery_path == destination or is_within(recovery_path, destination):
+        raise MigrationError("Recovery path must be separate from source and destination / 恢复路径必须独立于源路径和目标路径")
+    if recovery_path.is_symlink() or not recovery_path.is_dir():
+        raise MigrationError(f"Recovery path is not a real directory / 恢复路径不是实体目录: {recovery_path}")
 
-    Moving an iCloud-backed directory to Finder Trash preserves its root inode and
-    bytes but clears UF_HIDDEN throughout the tree, updates the root directory
-    mtime, and adds private Put Back xattrs to the root.  Those changes make a raw
-    stat snapshot unequal.  Accept them only when the Put Back marker is present,
-    every non-exception file still has its verified journal hash, and the complete
-    recovery tree otherwise matches the already verified destination.
-    """
-    expected_root = expected_snapshot.get(".")
-    actual_root = actual_snapshot.get(".")
-    if not isinstance(expected_root, dict) or not isinstance(actual_root, dict):
-        raise MigrationError(
-            "Recovery path does not match the journaled source tree / "
-            "恢复路径与日志中的源目录树不一致"
-        )
-    if (
-        actual_root.get("device") != expected_root.get("device")
-        or actual_root.get("inode") != expected_root.get("inode")
-    ):
-        raise MigrationError(
-            "Recovery path does not match the journaled source tree / "
-            "恢复路径与日志中的源目录树不一致"
-        )
-
-    initial_root_xattrs = xattr_map(recovery_path, follow_symlinks=False)
-    if (
-        recovery_path.parent.name != ".Trash"
-        or FILE_PROVIDER_TRASH_PUT_BACK_XATTR not in initial_root_xattrs
-    ):
-        raise MigrationError(
-            "Recovery path does not match the journaled source tree / "
-            "恢复路径与日志中的源目录树不一致"
-        )
-
-    recovery_entries, actual_snapshot = stabilize_fileprovider_trash_entries(recovery_path)
-    actual_root = actual_snapshot.get(".")
-    if not isinstance(actual_root, dict) or (
-        actual_root.get("device") != expected_root.get("device")
-        or actual_root.get("inode") != expected_root.get("inode")
-    ):
-        raise MigrationError(
-            "Recovery path does not match the journaled source tree / "
-            "恢复路径与日志中的源目录树不一致"
-        )
-
-    allow_ds_store_exception = verification_exception_enabled(state, "DS_STORE_ONLY")
-    allow_destination_only_provenance = verification_exception_enabled(
-        state, "DESTINATION_ONLY_PROVENANCE"
+    baseline = require_verification_records(state, "verified_source_records")
+    root_xattrs = xattr_map(recovery_path, follow_symlinks=False)
+    fileprovider = (
+        recovery_path.parent.name == ".Trash"
+        and FILE_PROVIDER_TRASH_PUT_BACK_XATTR in root_xattrs
     )
-    kind = str(state.get("kind"))
-    destination_entries = collect_verification_entries(destination)
-    if allow_ds_store_exception:
-        recovery_entries = {
-            relative: entry
-            for relative, entry in recovery_entries.items()
-            if not is_ds_store_entry(relative)
-        }
-        destination_entries = {
-            relative: entry
-            for relative, entry in destination_entries.items()
-            if not is_ds_store_entry(relative)
-        }
-    if set(recovery_entries) != set(destination_entries):
-        raise MigrationError(
-            "Recovery path does not match the verified destination tree / "
-            "恢复路径与已校验目标目录树不一致"
-        )
-
-    expected_hashes = state.get("file_sha256")
-    regular_paths = {
-        relative
-        for relative, (_path, metadata) in recovery_entries.items()
-        if stat.S_ISREG(metadata.st_mode)
-    }
-    if not isinstance(expected_hashes, dict) or set(expected_hashes) != regular_paths:
-        raise MigrationError(
-            "Migration journal lacks the complete verified recovery hashes / "
-            "迁移日志缺少完整的恢复文件校验哈希"
-        )
-
-    recovery_before = verification_stability_snapshot(recovery_entries, kind)
-    destination_before = verification_stability_snapshot(destination_entries, kind)
-    recovery_topology = hardlink_topology(recovery_entries, require_destination_isolation=False)
-    destination_topology = hardlink_topology(
-        destination_entries, require_destination_isolation=True
+    standard_trash = is_standard_finder_trash_recovery(recovery_path) and not fileprovider
+    allow_ds_store = verification_exception_enabled(state, "DS_STORE_ONLY")
+    all_entries = (
+        stabilize_fileprovider_trash_entries(recovery_path)
+        if fileprovider else collect_verification_entries(recovery_path)
     )
-    if recovery_topology != destination_topology:
-        raise MigrationError(
-            "Recovery hardlink topology differs from the verified destination / "
-            "恢复目录的硬链接结构与已校验目标不同"
-        )
+    actual_root = metadata_signature(all_entries["."][1])
+    expected_root = baseline["."]["_stability_stat"]
+    if any(actual_root[key] != expected_root[key] for key in ("inode", "device")):
+        raise MigrationError("Recovery path does not match the journaled source tree / 恢复路径与日志中的源目录树不一致")
+    entries = non_exception_entries(all_entries, allow_ds_store)
+    expected = non_exception_entries(baseline, allow_ds_store)
+    if set(entries) != set(expected):
+        raise MigrationError("Recovery tree differs from verified source / 恢复目录树与已验证源不同")
+    records = verification_stability_snapshot(entries, str(state["kind"]))
+    if fileprovider and FILE_PROVIDER_TRASH_PUT_BACK_XATTR not in records["."]["xattrs"]:
+        raise MigrationError("File Provider Put Back marker changed / 文件提供器放回标记发生变化")
 
-    root_xattrs = recovery_before["."].get("xattrs")
-    if (
-        recovery_path.parent.name != ".Trash"
-        or not isinstance(root_xattrs, dict)
-        or FILE_PROVIDER_TRASH_PUT_BACK_XATTR not in root_xattrs
-    ):
-        raise MigrationError(
-            "Recovery path does not match the journaled source tree / "
-            "恢复路径与日志中的源目录树不一致"
-        )
+    directory_mtimes = []
+    hidden_flags = 0
+    root_mtime = False
+    verified_at_ns = int(float(state["verified_at"]) * 1_000_000_000)
+    for relative, actual in records.items():
+        saved = expected[relative]
+        expected_stat = dict(saved["_stability_stat"])
+        actual_stat = dict(actual["_stability_stat"])
+        # Renaming into Trash changes ctime; all semantic metadata is checked below.
+        expected_stat.pop("ctime_ns", None)
+        actual_stat.pop("ctime_ns", None)
+        expected_record = {key: value for key, value in saved.items() if key != "_stability_stat"}
+        actual_record = {key: value for key, value in actual.items() if key != "_stability_stat"}
+        actual_record["xattrs"] = dict(actual_record["xattrs"])
 
-    hidden_flag_normalized = 0
-    root_mtime_normalized = False
-    for relative in sorted(recovery_entries):
-        recovery_path_entry, _recovery_metadata = recovery_entries[relative]
-        destination_path_entry, _destination_metadata = destination_entries[relative]
-        recovery_record = dict(recovery_before[relative])
-        destination_record = dict(destination_before[relative])
-        recovery_expected = recovery_record.pop("_stability_stat")
-        destination_expected = destination_record.pop("_stability_stat")
-        recovery_record["xattrs"] = dict(recovery_record["xattrs"])
-        destination_record["xattrs"] = dict(destination_record["xattrs"])
-        normalize_destination_only_app_xattrs(
-            recovery_record,
-            destination_record,
-            kind,
-            allow_data_destination_only_provenance=allow_destination_only_provenance,
-        )
+        if fileprovider and actual_stat["flags"] == (expected_stat["flags"] & ~UF_HIDDEN_FLAG):
+            if actual_stat["flags"] != expected_stat["flags"]:
+                hidden_flags += 1
+                expected_stat["flags"] = actual_stat["flags"]
+                expected_record["flags"] = actual_record["flags"]
 
-        recovery_flags = recovery_record.get("flags")
-        destination_flags = destination_record.get("flags")
-        if recovery_flags != destination_flags:
+        if actual_record["type"] == "directory" and expected_record["type"] == "directory":
+            child = ".DS_Store" if relative == "." else f"{relative}/.DS_Store"
+            allow_mtime = (fileprovider and relative == ".") or (
+                standard_trash and allow_ds_store and child in all_entries
+            )
             if (
-                not isinstance(recovery_flags, int)
-                or not isinstance(destination_flags, int)
-                or destination_flags != (recovery_flags | UF_HIDDEN_FLAG)
+                allow_mtime
+                and actual_stat["mtime_ns"] != expected_stat["mtime_ns"]
+                and actual_stat["mtime_ns"] >= max(expected_stat["mtime_ns"], verified_at_ns)
             ):
-                raise MigrationError(
-                    f"Recovery metadata differs / 恢复目录元数据不一致: {relative}"
-                )
-            destination_record["flags"] = recovery_flags
-            hidden_flag_normalized += 1
+                expected_stat["mtime_ns"] = actual_stat["mtime_ns"]
+                expected_record["mtime_ns"] = actual_record["mtime_ns"]
+                if fileprovider:
+                    root_mtime = True
+                else:
+                    directory_mtimes.append(relative)
+            # APFS directory link counts include file children, including .DS_Store.
+            if allow_ds_store:
+                delta = int(child in all_entries) - int(child in baseline)
+                if actual_stat["nlink"] == expected_stat["nlink"] + delta:
+                    expected_stat["nlink"] = actual_stat["nlink"]
 
-        if relative == ".":
+        if fileprovider and relative == ".":
             for name in FILE_PROVIDER_TRASH_PARENT_XATTRS:
-                recovery_record["xattrs"].pop(name, None)
-            if recovery_record.get("mtime_ns") != destination_record.get("mtime_ns"):
-                recovery_mtime = recovery_record.get("mtime_ns")
-                destination_mtime = destination_record.get("mtime_ns")
-                verified_at_ns = int(float(state.get("verified_at", 0)) * 1_000_000_000)
-                if (
-                    not isinstance(recovery_mtime, int)
-                    or not isinstance(destination_mtime, int)
-                    or recovery_mtime < destination_mtime
-                    or recovery_mtime < verified_at_ns
-                ):
-                    raise MigrationError(
-                        "Recovery root timestamp is not a post-verification Finder change / "
-                        "恢复目录根时间戳不是完整校验后的访达改动"
-                    )
-                destination_record["mtime_ns"] = recovery_mtime
-                root_mtime_normalized = True
+                if name not in expected_record["xattrs"]:
+                    actual_record["xattrs"].pop(name, None)
+        if actual_stat != expected_stat or actual_record != expected_record:
+            raise MigrationError(f"Recovery metadata differs from verified source / 恢复目录元数据与已验证源不一致: {relative}")
 
-        if recovery_record != destination_record:
-            raise MigrationError(
-                f"Recovery metadata differs / 恢复目录元数据不一致: {relative}"
-            )
-        if recovery_record["type"] == "file":
-            recovery_hash = stable_sha256_file(
-                recovery_path_entry, recovery_expected, relative
-            )
-            destination_hash = stable_sha256_file(
-                destination_path_entry, destination_expected, relative
-            )
-            if recovery_hash != destination_hash or recovery_hash != expected_hashes[relative]:
-                raise MigrationError(
-                    f"Recovery SHA-256 mismatch / 恢复目录 SHA-256 不一致: {relative}"
-                )
-
-    recovery_after_entries = collect_verification_entries(recovery_path)
-    destination_after_entries = collect_verification_entries(destination)
-    if allow_ds_store_exception:
-        recovery_after_entries = {
-            relative: entry
-            for relative, entry in recovery_after_entries.items()
-            if not is_ds_store_entry(relative)
-        }
-        destination_after_entries = {
-            relative: entry
-            for relative, entry in destination_after_entries.items()
-            if not is_ds_store_entry(relative)
-        }
-    if verification_stability_snapshot(recovery_after_entries, kind) != recovery_before:
+    verify_journal_hashes(entries, records, state)
+    if check_destination:
+        validate_verified_destination(destination, state)
+    after = non_exception_entries(collect_verification_entries(recovery_path), allow_ds_store)
+    if verification_stability_snapshot(after, str(state["kind"])) != records:
         raise MigrationError("Recovery tree changed during validation / 校验期间恢复目录发生变化")
-    if verification_stability_snapshot(destination_after_entries, kind) != destination_before:
-        raise MigrationError(
-            "Destination changed during recovery validation / 恢复校验期间目标目录发生变化"
-        )
 
-    return {
+    receipt = {
         "recovery_path": str(recovery_path),
-        "device": actual_root.get("device"),
-        "inode": actual_root.get("inode"),
-        "snapshot_matches": False,
+        "device": actual_root["device"],
+        "inode": actual_root["inode"],
+        "snapshot_matches": snapshot_from_verification_records(records) == snapshot_from_verification_records(baseline),
         "journal_root_identity_matches": True,
-        "verified_destination_tree_matches": True,
+        "verified_destination_tree_matches": check_destination,
         "all_non_exception_regular_files_match_journal_hashes": True,
-        "fileprovider_trash_metadata": {
-            "put_back_marker": True,
-            "uf_hidden_cleared_entries": hidden_flag_normalized,
-            "root_mtime_updated_after_verification": root_mtime_normalized,
-            "recovery_only_xattrs": sorted(
-                bytes.fromhex(name).decode("utf-8")
-                for name in FILE_PROVIDER_TRASH_PARENT_XATTRS
-                if name in root_xattrs
-            ),
-        },
         "verified_at": time.time(),
     }
+    if fileprovider:
+        receipt["fileprovider_trash_metadata"] = {
+            "put_back_marker": True,
+            "uf_hidden_cleared_entries": hidden_flags,
+            "root_mtime_updated_after_verification": root_mtime,
+            "recovery_only_xattrs": sorted(
+                bytes.fromhex(name).decode("utf-8")
+                for name in FILE_PROVIDER_TRASH_PARENT_XATTRS if name in root_xattrs
+            ),
+        }
+    elif standard_trash and allow_ds_store:
+        receipt["finder_trash_ds_store_metadata"] = {
+            "explicit_ds_store_exception_recorded": True,
+            "ds_store_parent_directory_mtimes": directory_mtimes,
+        }
+    return receipt
 
 
 def require_saved_handoff_receipt(
@@ -2196,11 +1940,11 @@ def require_saved_handoff_receipt(
             "and --finder-handoff-verified / 迁移日志没有访达交接收据；请使用 --recovery-path 和 "
             "--finder-handoff-verified 重新执行 link"
         )
+    # The live destination can legitimately change after the first successful link.
+    # The retained recovery tree must still match the original immutable evidence.
     return validate_recovery_receipt(
-        source,
-        destination,
-        state,
-        lexical_absolute(receipt["recovery_path"]),
+        source, destination, state, lexical_absolute(receipt["recovery_path"]),
+        check_destination=False,
     )
 
 
