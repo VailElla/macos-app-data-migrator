@@ -67,6 +67,10 @@ python3 scripts/migrate_app_data.py verify \
 
 挂载 DMG 中的 `.app` 同样必须保持可访问到 `verify` 写入 `verified` 状态。卸载后不能用目标签名检查冒充源目标完整校验；若镜像已提前卸载，重新挂载并确认日志中的源路径和源宗卷身份后再继续。
 
+若严格校验只被 macOS 自动生成或改写的 `.DS_Store` 阻塞，必须先向用户列出准确差异并取得明确接受，才可在同一命令追加 `--allow-ds-store-exception`。该开关默认关闭，只排除文件名准确为 `.DS_Store` 的条目，并在迁移日志中分别记录源与目标的相对路径；其他文件、目录元数据、ACL、扩展属性、硬链接和 SHA-256 仍保持严格校验。不得把该确认扩展到其他 Finder 元数据、项目文件或未知差异。
+
+若剩余差异仅为目标端新增、且普通权限无法移除的 `com.apple.provenance`，必须再次列出命中数量与准确路径并取得用户明确接受，才可追加 `--allow-destination-only-provenance`。该开关不允许源端已有的 provenance 被改写，也不允许其他扩展属性、时间、权限、ACL、内容、树结构或硬链接差异；所有命中路径写入迁移日志。两个例外开关相互独立、默认关闭，不能用一次确认概括未知差异。
+
 ### 4A. 程序 `.app` 的访达交接
 
 直接从外接盘启动已校验的 `.app`，完成登录、读取现有数据、写入测试数据、完全退出、再次启动以及更新器检查。通过后运行：
@@ -86,6 +90,12 @@ python3 scripts/migrate_app_data.py reveal \
 ### 4B. 数据目录的访达交接
 
 完整校验后运行 `reveal`。默认在用户明确授权后，由 Codex 通过访达界面把准确的内置源目录移到系统废纸篓，但绝不清空废纸篓；操作前后都要核对源路径，确保外接副本仍可用。这样会立即腾出原路径，同时保留“放回原处”的回滚能力。若用户明确偏好同级备份，再改用 `原名.internal-backup` 的可回滚同卷改名。两种交接都不能改用终端 `mv` 或删除命令。确认原路径已腾出后，找到访达废纸篓中的准确恢复项目（或用户明确选择的同级 `.internal-backup`），再用源快照、inode 和设备号证明它仍是原目录。预演并建立一个很小的软链接：
+
+若源目录来自 iCloud Drive 的文件提供器，访达移入废纸篓会在保持根 inode 和内容不变的同时，清除目录树的 `UF_HIDDEN` 标志、更新根目录时间并添加“放回原处”扩展属性。`link` 只在准确的 File Provider Put Back 标记存在、根 inode/设备号匹配、目录树及硬链接结构一致、所有非例外普通文件同时匹配已校验目标和日志 SHA-256，且除此之外没有元数据差异时，才接受这组确定性的废纸篓元数据改写；具体归一化结果写入交接收据，但不保存私有扩展属性的值。
+
+标准本机废纸篓中，Finder 也可能在恢复目录及其子目录新建 `.DS_Store` 并连带更新这些父目录的 mtime。只有完整校验日志已记录用户明确接受的 `DS_STORE_ONLY` 例外、恢复路径准确位于当前用户的 `~/.Trash`、根 inode/设备号匹配、每个被归一化的目录都直接包含 `.DS_Store`、时间变化发生在完整校验之后，并且所有非例外文件哈希、其余元数据、目录树与硬链接仍与已校验目标一致时，`link` 才接受这些父目录时间变化。
+
+`verify` 会冻结源和目标的逐项校验证据。首次 `link` 必须同时核对恢复副本和目标：恢复副本的每个条目都须保留原始身份、属主/属组、权限、软链接目标、ACL、扩展属性及文件哈希，只有上述明确例外可以归一化；不能仅凭两个当前副本互相一致就放行。首次交接成功后，重复 `link` 仍核验恢复副本及原始证据，但允许应用正常修改工作目标。缺少不可变元数据证据的旧日志会安全停止，须在原始源仍可用时重新 `verify` 后再交接。
 
 ```bash
 python3 scripts/migrate_app_data.py link \
@@ -150,6 +160,8 @@ Run the `verify` command shown above. It re-hashes every regular file and compar
 
 An app inside a mounted DMG must likewise remain accessible until `verify` records `verified`. A destination signature check cannot substitute for source/destination verification after the image is detached; remount the image and confirm the journaled source path and source-volume identity before resuming.
 
+If strict verification is blocked only by macOS-created or modified `.DS_Store` entries, list the exact differences and obtain explicit user acceptance before adding `--allow-ds-store-exception`. This default-off flag excludes only entries whose exact filename is `.DS_Store`, records source and destination relative paths separately in the journal, and leaves every other file, directory metadata, ACL, xattr, hardlink, and SHA-256 check strict. If the only remaining difference is destination-only protected `com.apple.provenance`, again list the exact affected paths and obtain explicit acceptance before adding the independent, default-off `--allow-destination-only-provenance` flag. It never permits source-present provenance to change and never relaxes other xattrs, timestamps, permissions, ACLs, content, tree structure, or hardlinks. Both exception sets are recorded in the journal and neither confirmation covers unknown differences.
+
 ### 4A. Finder handoff for an `.app`
 
 Launch the verified app directly from the external volume. Test sign-in, existing-data reads, a safe write, full quit, relaunch, and updater behavior. Then run `reveal`; it only selects the internal `.app` in Finder. After the user confirms the external app works, the user moves the internal app to Trash in Finder. Do not create a source-path symlink for an app bundle.
@@ -161,6 +173,12 @@ Keep the real `.app` filename unless updater compatibility with renaming has bee
 ### 4B. Finder handoff for a data directory
 
 After full verification, run `reveal`. By default, after explicit user authorization, use the Finder UI to move the exact internal source directory to system Trash without emptying Trash; verify the exact source path before and after and keep the external copy available. This frees the original path while preserving Finder's Put Back rollback. Use a reversible same-volume rename to `Name.internal-backup` only when the user explicitly prefers a sibling backup. Never substitute Terminal `mv` or a deletion command for either handoff. Before `link`, provide the exact recovery path and the explicit Finder-handoff attestation; the helper compares the saved source snapshot, inode, and device before creating a symlink. If the app uses a native location setting or a security-scoped adapter, configure that instead of creating a symlink.
+
+For an iCloud Drive File Provider source, Finder Trash deterministically clears `UF_HIDDEN` across the tree, updates the recovery-root timestamp, and adds private Put Back xattrs while preserving the root inode and bytes. `link` accepts this normalization only when the exact File Provider Put Back marker exists, root inode/device match, tree and hardlink topology match, every non-exception regular file matches both the verified destination and the journaled SHA-256, and no other metadata differs. The handoff receipt records the normalization without storing private xattr values.
+
+In the standard local Trash, Finder may also create `.DS_Store` inside the recovery root or descendants and thereby update those parent-directory mtimes. `link` accepts only those parent mtime changes when the journal already records the user's explicit `DS_STORE_ONLY` acceptance, the recovery path is exactly inside the current user's `~/.Trash`, root inode/device match, each normalized directory directly contains `.DS_Store`, the timestamp change occurred after full verification, and every non-exception hash, all other metadata, tree structure, and hardlink topology still match the verified destination.
+
+`verify` freezes per-entry source and destination evidence. The first `link` checks both the recovery copy and destination: every recovery entry must retain its original identity, ownership, permissions, symlink target, ACL, xattrs, and file hash except for the explicitly documented normalizations. Agreement between two current copies alone is insufficient. After the first handoff, repeated `link` calls still validate the recovery copy against the original evidence while allowing normal application writes to the working destination. Old journals lacking immutable metadata fail closed; repeat `verify` while the original source is available before handoff.
 
 A symlink consumes only a small amount of filesystem metadata; it is the only intentional internal write when original-path compatibility is required.
 

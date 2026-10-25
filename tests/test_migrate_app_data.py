@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import unittest
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict
 from unittest import mock
@@ -321,6 +322,93 @@ class MigrationTests(unittest.TestCase):
                 (destination / "a.bin").read_bytes(),
             )
 
+    def test_full_verify_ds_store_exception_is_explicit_and_narrow(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-ds-store-exception-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            write_file(source / "payload.bin", b"verified payload")
+            write_file(source / ".DS_Store", b"source Finder metadata")
+            (source / "nested").mkdir()
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+            (destination / ".DS_Store").write_bytes(b"destination Finder metadata")
+            write_file(destination / "nested" / ".DS_Store", b"target-only Finder metadata")
+            MIGRATOR_MODULE.copy_directory_metadata(source / "nested", destination / "nested")
+            MIGRATOR_MODULE.copy_directory_metadata(source, destination)
+
+            with self.assertRaises(MIGRATOR_MODULE.MigrationError):
+                MIGRATOR_MODULE.full_verify(source, destination)
+
+            hashes = MIGRATOR_MODULE.full_verify(
+                source,
+                destination,
+                allow_ds_store_exception=True,
+            )
+            self.assertEqual(hashes, {"payload.bin": sha256(source / "payload.bin")})
+
+            write_file(destination / "unexpected.bin", b"must remain strict")
+            MIGRATOR_MODULE.copy_directory_metadata(source, destination)
+            with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Tree entries differ"):
+                MIGRATOR_MODULE.full_verify(
+                    source,
+                    destination,
+                    allow_ds_store_exception=True,
+                )
+
+    def test_full_verify_destination_only_provenance_exception_is_narrow(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-data-provenance-exception-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            write_file(source / "payload.bin", b"verified payload")
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+            provenance = b"com.apple.provenance"
+
+            def destination_only_names(path: Path, _follow_symlinks: bool) -> list[bytes]:
+                return [provenance] if Path(path) == destination / "payload.bin" else []
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "list_xattr_names",
+                side_effect=destination_only_names,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "read_xattr",
+                return_value=b"destination-system-instance",
+            ):
+                with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Metadata differs"):
+                    MIGRATOR_MODULE.full_verify(source, destination)
+                hashes = MIGRATOR_MODULE.full_verify(
+                    source,
+                    destination,
+                    allow_destination_only_provenance=True,
+                )
+                self.assertEqual(hashes, {"payload.bin": sha256(source / "payload.bin")})
+
+            def both_names(path: Path, _follow_symlinks: bool) -> list[bytes]:
+                if Path(path) in {source / "payload.bin", destination / "payload.bin"}:
+                    return [provenance]
+                return []
+
+            def changed_values(path: Path, _name: bytes, _follow_symlinks: bool) -> bytes:
+                return b"source-value" if Path(path) == source / "payload.bin" else b"destination-value"
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "list_xattr_names",
+                side_effect=both_names,
+            ), mock.patch.object(
+                MIGRATOR_MODULE,
+                "read_xattr",
+                side_effect=changed_values,
+            ):
+                with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Metadata differs"):
+                    MIGRATOR_MODULE.full_verify(
+                        source,
+                        destination,
+                        allow_destination_only_provenance=True,
+                    )
+
     def test_verify_rechecks_processes_before_committing_verified_state(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-verify-process-") as temporary:
             root = Path(temporary)
@@ -365,6 +453,39 @@ class MigrationTests(unittest.TestCase):
                     MIGRATOR_MODULE.command_verify(arguments)
 
             self.assertEqual(process_is_running.call_count, 2)
+            self.assertEqual(state["status"], "copied")
+            write_state.assert_not_called()
+
+    def test_verify_rejects_source_change_before_recording_handoff_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-verify-snapshot-") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            destination = root / "destination"
+            write_file(source / "payload.bin", b"verified payload")
+            shutil.copytree(source, destination)
+            state = {
+                "schema_version": MIGRATOR_MODULE.SCHEMA_VERSION,
+                "migration_id": "a" * 32,
+                "source": str(source),
+                "destination": str(destination),
+                "kind": "data",
+                "status": "copied",
+                "process_names": ["ExampleProcess"],
+            }
+            arguments = argparse.Namespace(source=str(source), destination=str(destination))
+
+            def change_after_hashing(*args: Any, **kwargs: Any) -> Dict[str, str]:
+                hashes = {"payload.bin": sha256(source / "payload.bin")}
+                (source / "payload.bin").write_bytes(b"changed after verification")
+                return hashes
+
+            with mock.patch.object(MIGRATOR_MODULE, "load_state", return_value=state), \
+                mock.patch.object(MIGRATOR_MODULE, "require_journal_destination"), \
+                mock.patch.object(MIGRATOR_MODULE, "require_processes_stopped"), \
+                mock.patch.object(MIGRATOR_MODULE, "full_verify", side_effect=change_after_hashing), \
+                mock.patch.object(MIGRATOR_MODULE, "write_state") as write_state:
+                with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "Source changed"):
+                    MIGRATOR_MODULE.command_verify(arguments)
             self.assertEqual(state["status"], "copied")
             write_state.assert_not_called()
 
@@ -418,7 +539,13 @@ class MigrationTests(unittest.TestCase):
             destination = root / "external" / "Data"
             recovery = root / "Trash" / "Data"
             write_file(source / "payload.bin", b"recoverable source")
-            destination.mkdir(parents=True)
+            shutil.copytree(source, destination, copy_function=shutil.copy2)
+            source_records = MIGRATOR_MODULE.verification_stability_snapshot(
+                MIGRATOR_MODULE.collect_verification_entries(source), "data"
+            )
+            destination_records = MIGRATOR_MODULE.verification_stability_snapshot(
+                MIGRATOR_MODULE.collect_verification_entries(destination), "data"
+            )
             snapshot = MIGRATOR_MODULE.source_snapshot(source)
             recovery.parent.mkdir()
             os.rename(source, recovery)
@@ -431,6 +558,10 @@ class MigrationTests(unittest.TestCase):
                 "status": "verified",
                 "process_names": ["ExampleProcess"],
                 "source_snapshot": snapshot,
+                "verified_source_records": source_records,
+                "verified_destination_records": destination_records,
+                "verified_at": 0,
+                "file_sha256": {"payload.bin": sha256(recovery / "payload.bin")},
             }
             arguments = argparse.Namespace(
                 source=str(source),
@@ -875,6 +1006,279 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(
                 linked_state["handoff_receipt"]["recovery_path"], str(trashed_source)
             )
+
+    def test_fileprovider_trash_recovery_normalizes_only_put_back_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-fileprovider-trash-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "App Data"
+            destination = self.external_parent("fileprovider-trash") / "App Data"
+            write_file(source / "content.bin", b"file-provider recoverable source")
+            hidden_flag = getattr(stat, "UF_HIDDEN", 0x00008000)
+            os.chflags(source, hidden_flag)
+            os.chflags(source / "content.bin", hidden_flag)
+
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            run_migrator("verify", "--source", str(source), "--destination", str(destination))
+            state = json.loads(
+                (
+                    destination.parent
+                    / f".{destination.name}.migrate-macos-app-data.json"
+                ).read_text(encoding="utf-8")
+            )
+
+            trash = root / ".Trash"
+            trash.mkdir()
+            recovery = trash / source.name
+            os.rename(source, recovery)
+            os.chflags(recovery, 0)
+            os.chflags(recovery / "content.bin", 0)
+            recovery_mtime = max(
+                destination.stat().st_mtime_ns + 1_000_000_000,
+                int(state["verified_at"] * 1_000_000_000) + 1_000_000_000,
+            )
+            os.utime(recovery, ns=(recovery.stat().st_atime_ns, recovery_mtime))
+
+            real_xattr_map = MIGRATOR_MODULE.xattr_map
+
+            def fileprovider_xattr_map(
+                path: Path,
+                follow_symlinks: bool,
+                ignored_names: frozenset[bytes] = frozenset(),
+            ) -> Dict[str, str]:
+                result = real_xattr_map(
+                    path,
+                    follow_symlinks=follow_symlinks,
+                    ignored_names=ignored_names,
+                )
+                if path == recovery:
+                    result = dict(result)
+                    result[MIGRATOR_MODULE.FILE_PROVIDER_TRASH_PUT_BACK_XATTR] = "00"
+                return result
+
+            with mock.patch.object(
+                MIGRATOR_MODULE, "xattr_map", side_effect=fileprovider_xattr_map
+            ), mock.patch.object(Path, "home", return_value=root):
+                receipt = MIGRATOR_MODULE.validate_recovery_receipt(
+                    source,
+                    destination,
+                    state,
+                    recovery,
+                )
+
+                # The marker must route File Provider recovery correctly even
+                # when Finder puts it in the ordinary home Trash directory.
+                (recovery / "content.bin").chmod(0o600)
+                with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "metadata differs"):
+                    MIGRATOR_MODULE.validate_recovery_receipt(source, destination, state, recovery)
+
+            self.assertFalse(receipt["snapshot_matches"])
+            self.assertTrue(receipt["journal_root_identity_matches"])
+            self.assertTrue(receipt["verified_destination_tree_matches"])
+            self.assertTrue(
+                receipt["all_non_exception_regular_files_match_journal_hashes"]
+            )
+            self.assertEqual(
+                receipt["fileprovider_trash_metadata"]["uf_hidden_cleared_entries"],
+                2,
+            )
+            self.assertTrue(receipt["fileprovider_trash_metadata"]["put_back_marker"])
+
+    def test_standard_finder_trash_normalizes_only_ds_store_parent_mtimes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="migrate-standard-trash-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "App Data"
+            destination = self.external_parent("standard-trash") / "App Data"
+            write_file(source / "content.bin", b"standard trash source")
+            write_file(source / "nested" / "payload.bin", b"nested payload")
+
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            run_migrator(
+                "verify",
+                "--source",
+                str(source),
+                "--destination",
+                str(destination),
+                "--allow-ds-store-exception",
+            )
+            state = json.loads(
+                (
+                    destination.parent
+                    / f".{destination.name}.migrate-macos-app-data.json"
+                ).read_text(encoding="utf-8")
+            )
+
+            trash = root / ".Trash"
+            trash.mkdir()
+            recovery = trash / source.name
+            os.rename(source, recovery)
+            write_file(recovery / ".DS_Store", b"Finder root metadata")
+            write_file(recovery / "nested" / ".DS_Store", b"Finder nested metadata")
+            changed_mtime = int(state["verified_at"] * 1_000_000_000) + 1_000_000_000
+            os.utime(recovery, ns=(recovery.stat().st_atime_ns, changed_mtime))
+            os.utime(
+                recovery / "nested",
+                ns=((recovery / "nested").stat().st_atime_ns, changed_mtime),
+            )
+
+            with mock.patch.object(
+                MIGRATOR_MODULE,
+                "is_standard_finder_trash_recovery",
+                return_value=True,
+            ):
+                receipt = MIGRATOR_MODULE.validate_recovery_receipt(
+                    source,
+                    destination,
+                    state,
+                    recovery,
+                )
+
+                without_acceptance = dict(state, verification_exceptions=[])
+                with self.assertRaises(MIGRATOR_MODULE.MigrationError):
+                    MIGRATOR_MODULE.validate_recovery_receipt(
+                        source, destination, without_acceptance, recovery
+                    )
+
+                # Matching recovery/destination tampering must still fail
+                # against the hashes recorded before the Finder handoff.
+                for base in (recovery, destination):
+                    payload = base / "content.bin"
+                    previous = payload.stat()
+                    payload.write_bytes(b"tampered trash source")
+                    os.utime(payload, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+                with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "SHA-256 mismatch"):
+                    MIGRATOR_MODULE.validate_recovery_receipt(source, destination, state, recovery)
+
+            self.assertFalse(receipt["snapshot_matches"])
+            self.assertEqual(
+                receipt["finder_trash_ds_store_metadata"][
+                    "ds_store_parent_directory_mtimes"
+                ],
+                [".", "nested"],
+            )
+
+    @contextmanager
+    def normalized_recovery_fixture(self, provider: str):
+        with tempfile.TemporaryDirectory(prefix="migrate-recovery-regression-") as temporary:
+            root = Path(temporary)
+            source = root / "internal" / "Data"
+            destination = self.external_parent("recovery-regression") / "Data"
+            write_file(source / "payload.bin", b"immutable recovery payload")
+            write_file(source / "second.bin", b"immutable recovery payload")
+            (source / "link").symlink_to("payload.bin")
+            (source / "empty").mkdir()
+            if provider == "fileprovider":
+                os.chflags(source, stat.UF_HIDDEN)
+                os.chflags(source / "payload.bin", stat.UF_HIDDEN)
+            run_migrator(*copy_arguments(source, destination), "--execute")
+            run_migrator(
+                "verify", "--source", str(source), "--destination", str(destination),
+                "--allow-ds-store-exception",
+            )
+            state = MIGRATOR_MODULE.load_state(destination)
+            (root / ".Trash").mkdir()
+            recovery = root / ".Trash" / source.name
+            source.rename(recovery)
+            if provider == "fileprovider":
+                os.chflags(recovery, 0)
+                os.chflags(recovery / "payload.bin", 0)
+            else:
+                write_file(recovery / ".DS_Store", b"Finder metadata")
+            changed_mtime = max(
+                int(state["verified_at"] * 1_000_000_000) + 1_000_000_000,
+                recovery.stat().st_mtime_ns,
+            )
+            os.utime(recovery, ns=(recovery.stat().st_atime_ns, changed_mtime))
+            real_xattrs = MIGRATOR_MODULE.xattr_map
+
+            def recovery_xattrs(path, follow_symlinks, ignored_names=frozenset()):
+                attributes = real_xattrs(path, follow_symlinks, ignored_names)
+                if provider == "fileprovider" and path == recovery:
+                    attributes[MIGRATOR_MODULE.FILE_PROVIDER_TRASH_PUT_BACK_XATTR] = "00"
+                return attributes
+
+            with mock.patch.object(Path, "home", return_value=root), mock.patch.object(
+                MIGRATOR_MODULE, "xattr_map", side_effect=recovery_xattrs
+            ):
+                yield source, destination, recovery, state
+
+    def test_trash_recovery_checks_immutable_metadata_in_both_modes(self) -> None:
+        for provider in ("standard", "fileprovider"):
+            for mutation in ("group", "permissions", "symlink", "xattr", "hardlink", "empty_directory"):
+                with self.subTest(provider=provider, mutation=mutation):
+                    with self.normalized_recovery_fixture(provider) as (source, destination, recovery, state):
+                        MIGRATOR_MODULE.validate_recovery_receipt(source, destination, state, recovery)
+                        if mutation == "group":
+                            old_gid = (recovery / "payload.bin").stat().st_gid
+                            groups = [gid for gid in os.getgroups() if gid != old_gid]
+                            if not groups:
+                                self.skipTest("No alternate member group available")
+                            os.chown(recovery / "payload.bin", -1, groups[0])
+                        else:
+                            # Equal mutations in both copies must not redefine
+                            # the source metadata accepted before Finder handoff.
+                            for tree in (recovery, destination):
+                                before = tree.stat()
+                                if mutation == "permissions":
+                                    (tree / "payload.bin").chmod(0o600)
+                                elif mutation == "symlink":
+                                    (tree / "link").unlink()
+                                    (tree / "link").symlink_to("missing-target")
+                                elif mutation == "xattr":
+                                    subprocess.run([
+                                        "/usr/bin/xattr", "-w", "com.example.review", "changed",
+                                        str(tree / "payload.bin"),
+                                    ], check=True)
+                                elif mutation == "hardlink":
+                                    (tree / "second.bin").unlink()
+                                    os.link(tree / "payload.bin", tree / "second.bin")
+                                elif mutation == "empty_directory":
+                                    (tree / "empty").rmdir()
+                                os.utime(tree, ns=(before.st_atime_ns, before.st_mtime_ns))
+                        with self.assertRaises(MIGRATOR_MODULE.MigrationError):
+                            MIGRATOR_MODULE.validate_recovery_receipt(source, destination, state, recovery)
+
+    def test_repeated_link_allows_live_writes_but_checks_recovery(self) -> None:
+        for provider in ("standard", "fileprovider"):
+            with self.subTest(provider=provider):
+                with self.normalized_recovery_fixture(provider) as (source, destination, recovery, state):
+                    arguments = argparse.Namespace(
+                        source=str(source), destination=str(destination), recovery_path=str(recovery),
+                        finder_handoff_verified=True, execute=True,
+                    )
+                    MIGRATOR_MODULE.command_link(arguments)
+                    self.assertTrue(source.is_symlink())
+                    (destination / "payload.bin").write_bytes(b"normal application write")
+                    write_file(destination / "created-by-app.bin", b"new file")
+                    MIGRATOR_MODULE.command_link(arguments)
+                    linked_state = MIGRATOR_MODULE.load_state(destination)
+                    self.assertEqual(linked_state["status"], "linked")
+                    self.assertEqual(source.resolve(), destination.resolve())
+                    # Altering only the retained recovery copy is still an error,
+                    # including same-length edits with restored modification time.
+                    payload = recovery / "payload.bin"
+                    before = payload.stat()
+                    payload.write_bytes(b"X" * before.st_size)
+                    os.utime(payload, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "SHA-256 mismatch"):
+                        MIGRATOR_MODULE.command_link(arguments)
+
+    def test_initial_link_rejects_destination_changed_since_verify(self) -> None:
+        with self.normalized_recovery_fixture("standard") as (source, destination, recovery, state):
+            (destination / "payload.bin").write_bytes(b"unexpected pre-handoff write")
+            arguments = argparse.Namespace(
+                source=str(source), destination=str(destination), recovery_path=str(recovery),
+                finder_handoff_verified=True, execute=True,
+            )
+            with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "destination changed"):
+                MIGRATOR_MODULE.command_link(arguments)
+            self.assertFalse(os.path.lexists(source))
+            self.assertEqual(MIGRATOR_MODULE.load_state(destination)["status"], "verified")
+
+    def test_normalized_recovery_requires_immutable_metadata_in_old_journal(self) -> None:
+        with self.normalized_recovery_fixture("standard") as (source, destination, recovery, state):
+            state.pop("verified_source_records")
+            with self.assertRaisesRegex(MIGRATOR_MODULE.MigrationError, "immutable verification metadata"):
+                MIGRATOR_MODULE.validate_recovery_receipt(source, destination, state, recovery)
 
     def test_dry_run_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="migrate-app-dry-") as temporary:
